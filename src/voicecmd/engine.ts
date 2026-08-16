@@ -384,6 +384,14 @@ export class VoiceEngine {
       if (QA_TRIGGER_PATTERN.test(query) || retell) {
         const q = retell ? query.replace(/^(重新|再)(说|讲|念|来)(一个|一遍|一次|下)?(消息)?/, '').trim() : query;
         songloft.log.info(`[VoiceEngine] [QA] Triggered query="${query}" q="${q}"`);
+        // 等待提示：小爱未先答时，先在调 DeepSeek 前念一句提示，避免计算期间静默像卡死
+        const PROMPT_MSG = '好的，正在调用DeepSeek，请稍等';
+        if (!xiaoaiReply.trim()) {
+          songloft.log.info('[VoiceEngine] [QA] Sending "正在调用DeepSeek" prompt (小爱未先答)');
+          await this.minaService.textToSpeech(accountId, msg.device_id, PROMPT_MSG);
+          // 等提示音念完再调 DeepSeek，避免后发 TTS 覆盖提示（约 11 字 ≈ 1.8s）
+          await new Promise(r => setTimeout(r, 1800));
+        }
         const reply = await this.aiAnalyzer.analyzeChat(q || query, aiConfig, xiaoaiReply);
         if (reply) {
           // 标注来源：问答回答先声明"来自DeepSeek"再念内容，方便与音箱自带回答区分
@@ -395,6 +403,10 @@ export class VoiceEngine {
             const waitMs = Math.min(xiaoaiReply.length * 280 + 800, 15000);
             songloft.log.info(`[VoiceEngine] [QA] Waiting for 小爱 reply to finish (~${Math.round(waitMs / 1000)}s, len=${xiaoaiReply.length}): "${xiaoaiReply.slice(0, 40)}"`);
             await new Promise(r => setTimeout(r, waitMs));
+            // 小爱先答场景：等小爱念完后念提示，再念正式回答，填补空窗且不与小爱/正式回答重叠
+            songloft.log.info('[VoiceEngine] [QA] Sending "正在调用DeepSeek" prompt (小爱已答完)');
+            await this.minaService.textToSpeech(accountId, msg.device_id, PROMPT_MSG);
+            await new Promise(r => setTimeout(r, 1800));
           }
           // 空闲（未播放音乐）时拆短句分段念，治长文本 TTS 重读；播放中只整段念，避免多条 TTS 打断播放
           const pm = this.playlistManagerMap.get(accountId, msg.device_id);
