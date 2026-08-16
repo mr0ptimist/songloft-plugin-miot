@@ -232,6 +232,13 @@ export class VoiceEngine {
   private resumeCancelled: boolean = false;
   private sleepTimers: Map<string, SleepTimer> = new Map();
 
+  /** QA 多轮对话上下文（按设备）：history 为最近问答轮次，activeUntil 为续接窗口截止时间 */
+  private qaContexts: Map<string, { history: Array<{ role: 'user' | 'assistant'; content: string }>; activeUntil: number }> = new Map();
+  /** QA 续接窗口时长（毫秒）：说"请问XXX"后 120s 内的简短回应可接上上下文 */
+  private static readonly QA_CONTINUATION_WINDOW = 120_000;
+  /** 保留的历史轮次上限（条数） */
+  private static readonly QA_HISTORY_MAX = 10;
+
   constructor(
     configManager: ConfigManager,
     accountManager: AccountManager,
@@ -381,9 +388,14 @@ export class VoiceEngine {
       // 1) 问答：以"请问"等触发词发起 → DeepSeek 直接回答并 TTS 念出
       // 问答：以"请问"等触发词发起，或"重新说/再说一遍"重述请求 → DeepSeek 回答（带来源标注）
       const retell = query.match(/^(重新|再)(说|讲|念|来)(一个|一遍|一次|下)?(消息)?/);
-      if (QA_TRIGGER_PATTERN.test(query) || retell) {
+      // 续接判断：QA 活跃窗口内（120s）的简短回应（"要/继续详细说明/再说说"等），
+      // 且非播放/控制意图时，进入带上下文的续聊
+      const isContinuation = this.isQAContinuation(msg.device_id, query);
+      if (QA_TRIGGER_PATTERN.test(query) || retell || isContinuation) {
         const q = retell ? query.replace(/^(重新|再)(说|讲|念|来)(一个|一遍|一次|下)?(消息)?/, '').trim() : query;
-        songloft.log.info(`[VoiceEngine] [QA] Triggered query="${query}" q="${q}"`);
+        const ctx = this.qaContexts.get(msg.device_id);
+        const history = ctx?.history || [];
+        songloft.log.info(`[VoiceEngine] [QA] Triggered query="${query}" q="${q}" continuation=${isContinuation} history=${history.length}`);
         // 等待提示：小爱未先答时，先在调 DeepSeek 前念一句提示，避免计算期间静默像卡死
         const PROMPT_MSG = '好的，正在调用DeepSeek，请稍等';
         if (!xiaoaiReply.trim()) {
@@ -392,16 +404,27 @@ export class VoiceEngine {
           // 等提示音念完再调 DeepSeek，避免后发 TTS 覆盖提示（约 11 字 ≈ 1.8s）
           await new Promise(r => setTimeout(r, 1800));
         }
-        const reply = await this.aiAnalyzer.analyzeChat(q || query, aiConfig, xiaoaiReply);
+        // 续接时忽略小爱接话（避免 DeepSeek 去评小爱的话打乱对话），纯按历史续聊
+        const chatXiaoaiReply = isContinuation ? '' : xiaoaiReply;
+        const reply = await this.aiAnalyzer.analyzeChat(q || query, aiConfig, chatXiaoaiReply, history);
         if (reply) {
           // 标注来源：问答回答先声明"来自DeepSeek"再念内容，方便与音箱自带回答区分
           const labeled = `来自DeepSeek，${reply}`;
           songloft.log.info(`[VoiceEngine] [QA] Replying: "${labeled.slice(0, 80)}"`);
+          // 更新多轮上下文：记 user/assistant 各一条，裁剪到最近 N 条，刷新续接窗口
+          const hist = ctx || { history: [], activeUntil: 0 };
+          hist.history.push({ role: 'user', content: q || query });
+          hist.history.push({ role: 'assistant', content: reply });
+          if (hist.history.length > VoiceEngine.QA_HISTORY_MAX) {
+            hist.history = hist.history.slice(-VoiceEngine.QA_HISTORY_MAX);
+          }
+          hist.activeUntil = Date.now() + VoiceEngine.QA_CONTINUATION_WINDOW;
+          this.qaContexts.set(msg.device_id, hist);
           // 若小爱已先回答（content 非空），估算其念完时间（中文 TTS 约 280ms/字 + 800ms 缓冲，上限 15s），
           // 等小爱说完再切入 DeepSeek，避免两条回答重叠/突兀
-          if (xiaoaiReply.trim()) {
-            const waitMs = Math.min(xiaoaiReply.length * 280 + 800, 15000);
-            songloft.log.info(`[VoiceEngine] [QA] Waiting for 小爱 reply to finish (~${Math.round(waitMs / 1000)}s, len=${xiaoaiReply.length}): "${xiaoaiReply.slice(0, 40)}"`);
+          if (chatXiaoaiReply.trim()) {
+            const waitMs = Math.min(chatXiaoaiReply.length * 280 + 800, 15000);
+            songloft.log.info(`[VoiceEngine] [QA] Waiting for 小爱 reply to finish (~${Math.round(waitMs / 1000)}s, len=${chatXiaoaiReply.length}): "${chatXiaoaiReply.slice(0, 40)}"`);
             await new Promise(r => setTimeout(r, waitMs));
             // 小爱先答场景：等小爱念完后念提示，再念正式回答，填补空窗且不与小爱/正式回答重叠
             songloft.log.info('[VoiceEngine] [QA] Sending "正在调用DeepSeek" prompt (小爱已答完)');
@@ -449,6 +472,25 @@ export class VoiceEngine {
       pm.suspendForVoiceInteraction();
       songloft.log.info('[VoiceEngine] Unmatched non-play command, suspending timer only (no auto resume)');
     }
+  }
+
+  /**
+   * QA 续接判断：该设备处于 QA 活跃窗口内（120s）且上一条是问答，本次是简短回应，
+   * 且非播放意图时，视为多轮对话续接（带上文继续聊）。
+   * 播放/控制意图在更早的固定规则/搜索阶段已被拦截，这里再兜底排除 PLAY_TRIGGER_PATTERN。
+   */
+  private isQAContinuation(deviceId: string, query: string): boolean {
+    const ctx = this.qaContexts.get(deviceId);
+    if (!ctx || ctx.history.length === 0) {
+      return false;
+    }
+    if (Date.now() > ctx.activeUntil) {
+      return false;
+    }
+    if (PLAY_TRIGGER_PATTERN.test(query)) {
+      return false;
+    }
+    return true;
   }
 
   private async ensureMemoryInitialized(): Promise<void> {

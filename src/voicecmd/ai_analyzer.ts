@@ -229,7 +229,13 @@ export class AIAnalyzer {
    * 仅在用户以"请问"等触发词发起问答时调用。
    * @param xiaoaiReply 小爱音箱已先给出的回答文本；非空时让 DeepSeek 判断其正确性并补充/纠正，空则自行理解回答
    */
-  async analyzeChat(query: string, config: AIConfig, xiaoaiReply?: string): Promise<string | null> {
+  /**
+   * 问答模式：直接调用 LLM 回答用户问题（纯文本，不 JSON 化）
+   * 仅在用户以"请问"等触发词发起问答、或处于 QA 续接窗口时调用。
+   * @param xiaoaiReply 小爱音箱已先给出的回答文本；非空时让 DeepSeek 判断其正确性并补充/纠正，空则自行理解回答
+   * @param history 多轮对话历史（[{role:'user'|'assistant', content}]），支持"继续详细说明"等续接
+   */
+  async analyzeChat(query: string, config: AIConfig, xiaoaiReply?: string, history?: Array<{ role: 'user' | 'assistant'; content: string }>): Promise<string | null> {
     if (!config.enabled || !config.api_url || !config.api_key) {
       return null;
     }
@@ -239,6 +245,7 @@ export class AIAnalyzer {
         : AI_CHAT_SYSTEM_PROMPT;
       const messages: Array<{ role: string; content: string | null; tool_calls?: unknown; tool_call_id?: string }> = [
         { role: 'system', content: sysPrompt },
+        ...(history || []),
         { role: 'user', content: query },
       ];
       // 配置了任务桥时启用工具调用：LLM 可自主决定调 query_usage 查询余额/用量
