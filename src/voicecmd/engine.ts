@@ -34,6 +34,27 @@ const QA_TRIGGER_PATTERN = /请问|问一下|问个问题|回答我|帮我答/;
 /** 播放意图触发词：包含这些词的语音才走 AI 音乐指令解析，其余（智能家居/唤醒词/闲聊）不调用 AI */
 const PLAY_TRIGGER_PATTERN = /播放|放一首|放个|放首|放一下|我想听|来一首|来几首|来首|点一首|听一下|听首歌|听个|播一下|随机播/;
 
+/**
+ * 将回答拆成 ≤maxLen 字的短句分段，优先在句末标点处断句。
+ * 仅用于空闲（未播放音乐）时的问答：MiIO 长文本 TTS 偶发"读一半断/重复念多遍"，
+ * 拆短句逐段念更稳；但播放中不分段（多条 TTS 反复打断播放是播放故障元凶）。
+ */
+function splitTtsSegments(text: string, maxLen = 30): string[] {
+  const pieces = text.match(/[^。！？!?；;]+[。！？!?；;]?/g) || [text];
+  const segments: string[] = [];
+  let cur = '';
+  for (const p of pieces) {
+    if ((cur + p).length <= maxLen) {
+      cur += p;
+    } else {
+      if (cur) segments.push(cur);
+      cur = p;
+    }
+  }
+  if (cur) segments.push(cur);
+  return segments.map(s => s.trim()).filter(Boolean);
+}
+
 /** 口令匹配结果 */
 interface MatchResult {
   command: VoiceCommand;
@@ -355,12 +376,23 @@ export class VoiceEngine {
     const aiConfig = await this.configManager.getAIConfig();
     if (aiConfig.enabled) {
       // 1) 问答：以"请问"等触发词发起 → DeepSeek 直接回答并 TTS 念出
-      if (QA_TRIGGER_PATTERN.test(query)) {
-        songloft.log.info(`[VoiceEngine] [QA] Triggered query="${query}"`);
-        const reply = await this.aiAnalyzer.analyzeChat(query, aiConfig);
+      // 问答：以"请问"等触发词发起，或"重新说/再说一遍"重述请求 → DeepSeek 回答（带来源标注）
+      const retell = query.match(/^(重新|再)(说|讲|念|来)(一个|一遍|一次|下)?(消息)?/);
+      if (QA_TRIGGER_PATTERN.test(query) || retell) {
+        const q = retell ? query.replace(/^(重新|再)(说|讲|念|来)(一个|一遍|一次|下)?(消息)?/, '').trim() : query;
+        songloft.log.info(`[VoiceEngine] [QA] Triggered query="${query}" q="${q}"`);
+        const reply = await this.aiAnalyzer.analyzeChat(q || query, aiConfig);
         if (reply) {
-          songloft.log.info(`[VoiceEngine] [QA] Replying: "${reply.slice(0, 80)}"`);
-          await this.minaService.textToSpeech(accountId, msg.device_id, reply);
+          // 标注来源：问答回答先声明"来自DeepSeek"再念内容，方便与音箱自带回答区分
+          const labeled = `来自DeepSeek，${reply}`;
+          songloft.log.info(`[VoiceEngine] [QA] Replying: "${labeled.slice(0, 80)}"`);
+          // 空闲（未播放音乐）时拆短句分段念，治长文本 TTS 重读；播放中只整段念，避免多条 TTS 打断播放
+          const pm = this.playlistManagerMap.get(accountId, msg.device_id);
+          const segments = (pm && pm.isPlaying()) ? [labeled] : splitTtsSegments(labeled);
+          for (let i = 0; i < segments.length; i++) {
+            if (i > 0) await new Promise(r => setTimeout(r, 800));
+            await this.minaService.textToSpeech(accountId, msg.device_id, segments[i]);
+          }
           return;
         }
         songloft.log.warn('[VoiceEngine] [QA] analyzeChat returned null, fall through');
