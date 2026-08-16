@@ -27,6 +27,7 @@ const AI_SYSTEM_PROMPT = `从指令中提取出操作和音乐信息，返回JSO
 5. 明确high模糊low其余medium
 6. rawText去语气词、口癖词
 7. "播放XX的歌/歌曲/音乐"或"来几首XX"中，name为泛称（歌/歌曲/音乐/曲/曲子）或无name时→action=play_artist,artist=XX。name为具体歌名时仍为play_song
+8. 外国歌手用户用中文音译时，artist输出常用英文名：如"泰勒斯威夫特"→"Taylor Swift"、"贾斯汀比伯"→"Justin Bieber"、"阿黛尔"→"Adele"、"碧昂丝"→"Beyoncé"、"艾薇儿"→"Avril Lavigne"。中文名歌手保持中文
 
 示例：
 周杰伦的晴天→{"action":"play_song","params":{"name":"晴天","artist":"周杰伦"},"confidence":"high","rawText":"周杰伦 晴天"}
@@ -43,7 +44,8 @@ const AI_SYSTEM_PROMPT = `从指令中提取出操作和音乐信息，返回JSO
 再听3首就停→{"action":"sleep_timer","params":{"songs_count":3},"confidence":"high","rawText":"再听3首就停"}
 5首歌后停止播放→{"action":"sleep_timer","params":{"songs_count":5},"confidence":"high","rawText":"5首歌后停止播放"}
 取消定时→{"action":"cancel_sleep_timer","params":{},"confidence":"high","rawText":"取消定时"}
-还有多久停→{"action":"query_sleep_timer","params":{},"confidence":"high","rawText":"还有多久停"}`;
+还有多久停→{"action":"query_sleep_timer","params":{},"confidence":"high","rawText":"还有多久停"}
+播放泰勒斯威夫特的歌→{"action":"play_artist","params":{"artist":"Taylor Swift"},"confidence":"high","rawText":"泰勒斯威夫特"}`;
 
 /** AI 问答 System Prompt（仅在用户以"请问"等触发词发起问答时使用） */
 const AI_CHAT_SYSTEM_PROMPT = `你是智能音箱里的 AI 助手（小爱同学）。用中文简洁、准确地回答用户的问题，不超过80字。不要提到"我无法""我不能"等推脱，直接给出答案；不确定就说"我不确定"。`;
