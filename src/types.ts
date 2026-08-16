@@ -262,6 +262,10 @@ export interface AIConfig {
   api_key: string;
   model: string;
   timeout: number;         // 秒数，默认 6
+  /** 任务桥地址（可选；配置后启用 LLM 工具调用）。如 http://192.168.0.2:8123 */
+  bridge_url?: string;
+  /** 任务桥鉴权 token（X-Bridge-Token） */
+  bridge_token?: string;
 }
 
 /** AI 分析结果 */

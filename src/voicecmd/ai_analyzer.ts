@@ -50,6 +50,39 @@ const AI_SYSTEM_PROMPT = `从指令中提取出操作和音乐信息，返回JSO
 /** AI 问答 System Prompt（仅在用户以"请问"等触发词发起问答时使用） */
 const AI_CHAT_SYSTEM_PROMPT = `你是智能音箱里的 AI 助手（小爱同学）。用中文简洁、准确地回答用户的问题，不超过80字。不要提到"我无法""我不能"等推脱，直接给出答案；不确定就说"我不确定"。`;
 
+/** 任务桥工具声明：LLM 可自主决定调用 query_usage 查询账户余额/用量（走 songloft 任务桥执行） */
+const USAGE_TOOLS = [{
+  type: 'function',
+  function: {
+    name: 'query_usage',
+    description: '查询 DeepSeek / 火山方舟 / 雷火 的账户余额与用量',
+    parameters: {
+      type: 'object',
+      properties: {
+        which: {
+          type: 'string',
+          enum: ['deepseek', 'ark', 'leihuo'],
+          description: '要查询哪种：deepseek=DeepSeek余额, ark=火山方舟用量, leihuo=雷火网关剩余额度',
+        },
+      },
+      required: ['which'],
+    },
+  },
+}] as const;
+
+/** LLM 返回的单条工具调用 */
+interface AIToolCall {
+  id: string;
+  name: string;
+  args: Record<string, unknown>;
+}
+
+/** LLM 返回的消息（content + 可选 tool_calls） */
+interface LLMMessageResult {
+  content: string;
+  toolCalls: AIToolCall[];
+}
+
 /**
  * AI 口令分析器
  * 调用 LLM API 分析用户语音指令，提取操作类型和参数
@@ -96,6 +129,19 @@ export class AIAnalyzer {
    * @param opts.json 音乐指令用 JSON 模式（强制 response_format）；问答用纯文本模式
    */
   private async callLLM(messages: Array<{ role: string; content: string }>, config: AIConfig, opts: { json?: boolean } = {}): Promise<string> {
+    const res = await this.callLLMMessages(messages, config, opts);
+    return res.content;
+  }
+
+  /**
+   * 调用 LLM API，返回完整消息（content + tool_calls）
+   * @param opts.json 音乐指令用 JSON 模式；opts.tools 问答/任务桥工具声明
+   */
+  private async callLLMMessages(
+    messages: Array<{ role: string; content: string | null; tool_calls?: unknown; tool_call_id?: string }>,
+    config: AIConfig,
+    opts: { json?: boolean; tools?: unknown[] } = {},
+  ): Promise<LLMMessageResult> {
     songloft.log.info(`[AIAnalyzer] Calling ${config.api_url} model=${config.model} timeout=${config.timeout}s`);
 
     const body: Record<string, unknown> = {
@@ -107,6 +153,10 @@ export class AIAnalyzer {
     if (opts.json) {
       body.response_format = { type: 'json_object' };
       body.extra_body = { reasoning_split: true };
+    }
+    if (opts.tools && opts.tools.length) {
+      body.tools = opts.tools;
+      body.tool_choice = 'auto';
     }
 
     const fetchPromise = fetch(`${config.api_url}/chat/completions`, {
@@ -135,18 +185,32 @@ export class AIAnalyzer {
     }
 
     const data = await resp.json();
-    const content = data.choices?.[0]?.message?.content as string | undefined;
+    const msg = data.choices?.[0]?.message as {
+      content?: string | null;
+      tool_calls?: Array<{ id: string; function: { name: string; arguments: string } }>;
+    } | undefined;
     const finishReason = data.choices?.[0]?.finish_reason as string | undefined;
-    if (!content) {
+
+    if (!msg) {
       throw new Error('Empty response from AI API');
     }
-
-    if (finishReason && finishReason !== 'stop') {
+    if (finishReason && finishReason !== 'stop' && finishReason !== 'tool_calls') {
       songloft.log.warn(`[AIAnalyzer] Finish reason: ${finishReason} (content may be truncated)`);
     }
 
-    songloft.log.info(`[AIAnalyzer] API response: ${content.slice(0, 200)}`);
-    return content;
+    const content = (msg.content || '').trim();
+    const toolCalls: AIToolCall[] = (msg.tool_calls || []).map(tc => {
+      let args: Record<string, unknown> = {};
+      try {
+        args = JSON.parse(tc.function.arguments || '{}');
+      } catch {
+        args = { _raw: tc.function.arguments };
+      }
+      return { id: tc.id, name: tc.function.name, args };
+    });
+
+    songloft.log.info(`[AIAnalyzer] API response: "${content.slice(0, 150)}"${toolCalls.length ? ` + ${toolCalls.length} tool_call(s): ${toolCalls.map(t => `${t.name}(${JSON.stringify(t.args)})`).join(', ')}` : ''}`);
+    return { content, toolCalls };
   }
 
   /**
@@ -173,15 +237,74 @@ export class AIAnalyzer {
       const sysPrompt = (xiaoaiReply && xiaoaiReply.trim())
         ? `${AI_CHAT_SYSTEM_PROMPT}\n\n小爱音箱已经先回答了用户的问题，小爱的回答是：「${xiaoaiReply.trim()}」。请判断小爱的回答是否正确、完整：若小爱说错或遗漏，指出哪里不对并给出正确的完整回答；若小爱说得对，简要认可并补充一两个要点。不要重复小爱已说对的内容，总长度不超过80字。`
         : AI_CHAT_SYSTEM_PROMPT;
-      const content = await this.callLLM([
+      const messages: Array<{ role: string; content: string | null; tool_calls?: unknown; tool_call_id?: string }> = [
         { role: 'system', content: sysPrompt },
         { role: 'user', content: query },
-      ], config, { json: false });
-      const reply = content.trim().replace(/^["'“”]+|["'“”]+$/g, '').slice(0, 100);
+      ];
+      // 配置了任务桥时启用工具调用：LLM 可自主决定调 query_usage 查询余额/用量
+      const tools = (config.bridge_url && config.bridge_token) ? USAGE_TOOLS : undefined;
+
+      let res = await this.callLLMMessages(messages, config, { tools });
+      // 工具调用循环：执行桥任务 → 回填 tool 结果 → 再调 LLM（最多 3 轮防死循环）
+      let round = 0;
+      while (res.toolCalls.length && round < 3) {
+        round++;
+        songloft.log.info(`[AIAnalyzer] [Tool] round ${round}: executing ${res.toolCalls.length} call(s)`);
+        const assistantMsg = {
+          role: 'assistant',
+          content: res.content || null,
+          tool_calls: res.toolCalls.map(tc => ({
+            id: tc.id,
+            type: 'function',
+            function: { name: tc.name, arguments: JSON.stringify(tc.args) },
+          })),
+        };
+        const toolMessages = [...messages, assistantMsg];
+        for (const tc of res.toolCalls) {
+          const result = await this.executeBridgeTool(tc, config);
+          songloft.log.info(`[AIAnalyzer] [Tool] ${tc.name}(${JSON.stringify(tc.args)}) → ${result}`);
+          toolMessages.push({ role: 'tool', tool_call_id: tc.id, content: result });
+        }
+        res = await this.callLLMMessages(toolMessages, config, { tools });
+      }
+
+      const reply = res.content
+        .replace(/\*\*|__/g, '')               // 去掉加粗/强调符号，避免 TTS 念出星号
+        .replace(/`/g, '')
+        .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1') // markdown 链接只留文字
+        .replace(/^#{1,6}\s+/gm, '')
+        .trim()
+        .replace(/^["'“”]+|["'“”]+$/g, '')
+        .slice(0, 120);
       return reply || null;
     } catch (e) {
       songloft.log.warn(`[AIAnalyzer] chat analysis failed: ${String(e)}`);
       return null;
+    }
+  }
+
+  /**
+   * 执行任务桥工具：POST {bridge_url}/run {task: which}，返回结果文本
+   * 桥在服务器宿主机（songloft-bridge），凭据/脚本都在服务器，全部本地执行
+   */
+  private async executeBridgeTool(tc: AIToolCall, config: AIConfig): Promise<string> {
+    const which = String(tc.args?.which || '');
+    if (!config.bridge_url) return '（未配置任务桥）';
+    try {
+      const resp = await fetch(`${config.bridge_url}/run`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Bridge-Token': config.bridge_token || '',
+        },
+        body: JSON.stringify({ task: which }),
+      });
+      const data = await resp.json() as { ok?: boolean; result?: unknown; error?: string };
+      if (data.ok) return String(data.result ?? '');
+      return `查询失败：${data.error || '未知错误'}`;
+    } catch (e) {
+      songloft.log.warn(`[AIAnalyzer] [Tool] bridge call failed: ${String(e)}`);
+      return `任务桥调用失败：${String(e)}`;
     }
   }
 
