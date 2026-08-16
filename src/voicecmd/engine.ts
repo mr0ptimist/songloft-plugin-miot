@@ -950,6 +950,16 @@ export class VoiceEngine {
       case 'query_sleep_timer':
         await this.executeQuerySleepTimer(accountId, deviceId);
         break;
+      case 'chat': {
+        const reply = result.params.reply || '';
+        if (reply) {
+          songloft.log.info(`[VoiceEngine] [AI] Chat reply: "${reply.slice(0, 80)}"`);
+          await this.minaService.textToSpeech(accountId, deviceId, reply);
+        } else {
+          songloft.log.warn('[VoiceEngine] [AI] chat: empty reply');
+        }
+        break;
+      }
       default:
         songloft.log.warn(`[VoiceEngine] [AI] Unknown action: ${result.action}`);
     }
@@ -962,7 +972,7 @@ export class VoiceEngine {
    * 非播放类命令执行后，尝试恢复被小爱语音唤醒中断的 URL 播放
    */
   private tryResumePlayback(commandType: string, wasPlaying: boolean, pm: import('../player/manager').PlaylistManager | null, accountId: string, deviceId: string): void {
-    const isNonPlaybackCommand = commandType === 'set_volume' || commandType === 'set_play_mode' || commandType === 'favorite';
+    const isNonPlaybackCommand = commandType === 'set_volume' || commandType === 'set_play_mode' || commandType === 'favorite' || commandType === 'chat';
     if (!isNonPlaybackCommand || !wasPlaying || !pm) return;
 
     pm.suspendForVoiceInteraction();
