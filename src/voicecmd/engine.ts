@@ -320,6 +320,9 @@ export class VoiceEngine {
       return;
     }
 
+    // 小爱自己的回答文本（用于问答时估算"小爱说完"再让 DeepSeek 切入，避免两条回答重叠/突兀）
+    const xiaoaiReply = (msg.message?.response?.answer?.[0]?.content as string) || '';
+
     // 找到设备对应的 accountId
     const accountId = await this.findAccountForDevice(msg.device_id);
     if (!accountId) {
@@ -381,11 +384,18 @@ export class VoiceEngine {
       if (QA_TRIGGER_PATTERN.test(query) || retell) {
         const q = retell ? query.replace(/^(重新|再)(说|讲|念|来)(一个|一遍|一次|下)?(消息)?/, '').trim() : query;
         songloft.log.info(`[VoiceEngine] [QA] Triggered query="${query}" q="${q}"`);
-        const reply = await this.aiAnalyzer.analyzeChat(q || query, aiConfig);
+        const reply = await this.aiAnalyzer.analyzeChat(q || query, aiConfig, xiaoaiReply);
         if (reply) {
           // 标注来源：问答回答先声明"来自DeepSeek"再念内容，方便与音箱自带回答区分
           const labeled = `来自DeepSeek，${reply}`;
           songloft.log.info(`[VoiceEngine] [QA] Replying: "${labeled.slice(0, 80)}"`);
+          // 若小爱已先回答（content 非空），估算其念完时间（中文 TTS 约 280ms/字 + 800ms 缓冲，上限 15s），
+          // 等小爱说完再切入 DeepSeek，避免两条回答重叠/突兀
+          if (xiaoaiReply.trim()) {
+            const waitMs = Math.min(xiaoaiReply.length * 280 + 800, 15000);
+            songloft.log.info(`[VoiceEngine] [QA] Waiting for 小爱 reply to finish (~${Math.round(waitMs / 1000)}s, len=${xiaoaiReply.length}): "${xiaoaiReply.slice(0, 40)}"`);
+            await new Promise(r => setTimeout(r, waitMs));
+          }
           // 空闲（未播放音乐）时拆短句分段念，治长文本 TTS 重读；播放中只整段念，避免多条 TTS 打断播放
           const pm = this.playlistManagerMap.get(accountId, msg.device_id);
           const segments = (pm && pm.isPlaying()) ? [labeled] : splitTtsSegments(labeled);

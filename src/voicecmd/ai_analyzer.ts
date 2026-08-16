@@ -162,15 +162,19 @@ export class AIAnalyzer {
 
   /**
    * 问答模式：直接调用 LLM 回答用户问题（纯文本，不 JSON 化）
-   * 仅在用户以"请问"等触发词发起问答时调用
+   * 仅在用户以"请问"等触发词发起问答时调用。
+   * @param xiaoaiReply 小爱音箱已先给出的回答文本；非空时让 DeepSeek 判断其正确性并补充/纠正，空则自行理解回答
    */
-  async analyzeChat(query: string, config: AIConfig): Promise<string | null> {
+  async analyzeChat(query: string, config: AIConfig, xiaoaiReply?: string): Promise<string | null> {
     if (!config.enabled || !config.api_url || !config.api_key) {
       return null;
     }
     try {
+      const sysPrompt = (xiaoaiReply && xiaoaiReply.trim())
+        ? `${AI_CHAT_SYSTEM_PROMPT}\n\n小爱音箱已经先回答了用户的问题，小爱的回答是：「${xiaoaiReply.trim()}」。请判断小爱的回答是否正确、完整：若小爱说错或遗漏，指出哪里不对并给出正确的完整回答；若小爱说得对，简要认可并补充一两个要点。不要重复小爱已说对的内容，总长度不超过80字。`
+        : AI_CHAT_SYSTEM_PROMPT;
       const content = await this.callLLM([
-        { role: 'system', content: AI_CHAT_SYSTEM_PROMPT },
+        { role: 'system', content: sysPrompt },
         { role: 'user', content: query },
       ], config, { json: false });
       const reply = content.trim().replace(/^["'“”]+|["'“”]+$/g, '').slice(0, 100);
