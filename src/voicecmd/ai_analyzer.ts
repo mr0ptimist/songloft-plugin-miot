@@ -18,7 +18,6 @@ const AI_SYSTEM_PROMPT = `从指令中提取出操作和音乐信息，返回JSO
 - cancel_sleep_timer: 取消定时停止
 - query_sleep_timer: 查询定时剩余时间
 - next/previous/stop/unknown
-- chat: reply(回答文本，直接回答用户的问题，简明扼要，不超过80字)
 
 规则：
 1. "XX的YY"中XX是歌手名则artist=XX,name=YY，否则整句为歌名（如"你的答案"→name）
@@ -28,7 +27,6 @@ const AI_SYSTEM_PROMPT = `从指令中提取出操作和音乐信息，返回JSO
 5. 明确high模糊low其余medium
 6. rawText去语气词、口癖词
 7. "播放XX的歌/歌曲/音乐"或"来几首XX"中，name为泛称（歌/歌曲/音乐/曲/曲子）或无name时→action=play_artist,artist=XX。name为具体歌名时仍为play_song
-8. 非音乐指令（常识问答、闲聊、生活问题等）→action=chat,reply填简明回答（80字内）。音乐指令永远优先于chat
 
 示例：
 周杰伦的晴天→{"action":"play_song","params":{"name":"晴天","artist":"周杰伦"},"confidence":"high","rawText":"周杰伦 晴天"}
@@ -45,10 +43,10 @@ const AI_SYSTEM_PROMPT = `从指令中提取出操作和音乐信息，返回JSO
 再听3首就停→{"action":"sleep_timer","params":{"songs_count":3},"confidence":"high","rawText":"再听3首就停"}
 5首歌后停止播放→{"action":"sleep_timer","params":{"songs_count":5},"confidence":"high","rawText":"5首歌后停止播放"}
 取消定时→{"action":"cancel_sleep_timer","params":{},"confidence":"high","rawText":"取消定时"}
-还有多久停→{"action":"query_sleep_timer","params":{},"confidence":"high","rawText":"还有多久停"}
-今天天气怎么样→{"action":"chat","params":{"reply":"我这边查不到实时天气，可以看看手机上的天气应用"},"confidence":"high","rawText":"今天天气怎么样"}
-周杰伦的生日是什么时候→{"action":"chat","params":{"reply":"周杰伦出生于1979年1月18日"},"confidence":"high","rawText":"周杰伦的生日是什么时候"}
-1加1等于几→{"action":"chat","params":{"reply":"1加1等于2"},"confidence":"high","rawText":"1加1等于2"}`;
+还有多久停→{"action":"query_sleep_timer","params":{},"confidence":"high","rawText":"还有多久停"}`;
+
+/** AI 问答 System Prompt（仅在用户以"请问"等触发词发起问答时使用） */
+const AI_CHAT_SYSTEM_PROMPT = `你是智能音箱里的 AI 助手（小爱同学）。用中文简洁、准确地回答用户的问题，不超过80字。不要提到"我无法""我不能"等推脱，直接给出答案；不确定就说"我不确定"。`;
 
 /**
  * AI 口令分析器
@@ -91,22 +89,23 @@ export class AIAnalyzer {
   /**
    * 调用 LLM API
    */
-  private async callAI(query: string, config: AIConfig): Promise<AIAnalysisResult> {
+  /**
+   * 调用 LLM API，返回模型生成的文本内容
+   * @param opts.json 音乐指令用 JSON 模式（强制 response_format）；问答用纯文本模式
+   */
+  private async callLLM(messages: Array<{ role: string; content: string }>, config: AIConfig, opts: { json?: boolean } = {}): Promise<string> {
     songloft.log.info(`[AIAnalyzer] Calling ${config.api_url} model=${config.model} timeout=${config.timeout}s`);
-
-    const messages = [
-      { role: 'system', content: AI_SYSTEM_PROMPT },
-      { role: 'user', content: `用户指令：${query}` },
-    ];
 
     const body: Record<string, unknown> = {
       model: config.model,
       messages,
       temperature: 1.0,
-      max_tokens: 300,
-      response_format: { type: 'json_object' },
-      extra_body: { reasoning_split: true },
+      max_tokens: opts.json ? 300 : 500,
     };
+    if (opts.json) {
+      body.response_format = { type: 'json_object' };
+      body.extra_body = { reasoning_split: true };
+    }
 
     const fetchPromise = fetch(`${config.api_url}/chat/completions`, {
       method: 'POST',
@@ -145,7 +144,39 @@ export class AIAnalyzer {
     }
 
     songloft.log.info(`[AIAnalyzer] API response: ${content.slice(0, 200)}`);
+    return content;
+  }
+
+  /**
+   * 调用 LLM API 分析音乐指令（JSON 模式）
+   */
+  private async callAI(query: string, config: AIConfig): Promise<AIAnalysisResult> {
+    const content = await this.callLLM([
+      { role: 'system', content: AI_SYSTEM_PROMPT },
+      { role: 'user', content: `用户指令：${query}` },
+    ], config, { json: true });
     return this.parseResponse(content);
+  }
+
+  /**
+   * 问答模式：直接调用 LLM 回答用户问题（纯文本，不 JSON 化）
+   * 仅在用户以"请问"等触发词发起问答时调用
+   */
+  async analyzeChat(query: string, config: AIConfig): Promise<string | null> {
+    if (!config.enabled || !config.api_url || !config.api_key) {
+      return null;
+    }
+    try {
+      const content = await this.callLLM([
+        { role: 'system', content: AI_CHAT_SYSTEM_PROMPT },
+        { role: 'user', content: query },
+      ], config, { json: false });
+      const reply = content.trim().replace(/^["'“”]+|["'“”]+$/g, '').slice(0, 100);
+      return reply || null;
+    } catch (e) {
+      songloft.log.warn(`[AIAnalyzer] chat analysis failed: ${String(e)}`);
+      return null;
+    }
   }
 
   /**

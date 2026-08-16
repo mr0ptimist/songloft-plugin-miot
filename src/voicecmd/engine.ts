@@ -28,6 +28,12 @@ export { getDefaultVoiceCommands } from './defaults';
 
 // ===== 类型定义 =====
 
+/** 问答触发词：只有包含这些词的语音才调用 DeepSeek 直接回答（用户显式发起问答） */
+const QA_TRIGGER_PATTERN = /请问|问一下|问个问题|回答我|帮我答/;
+
+/** 播放意图触发词：包含这些词的语音才走 AI 音乐指令解析，其余（智能家居/唤醒词/闲聊）不调用 AI */
+const PLAY_TRIGGER_PATTERN = /播放|放一首|放个|放首|放一下|我想听|来一首|来几首|来首|点一首|听一下|听首歌|听个|播一下|随机播/;
+
 /** 口令匹配结果 */
 interface MatchResult {
   command: VoiceCommand;
@@ -345,34 +351,49 @@ export class VoiceEngine {
 
     songloft.log.info(`[VoiceEngine] [Rule] No search match found`);
 
-    // AI 兜底（如果启用）
+    // AI 兜底（如果启用）——仅对"问答"和"播放"意图触发，其余（智能家居/唤醒词/闲聊）不调用 AI
     const aiConfig = await this.configManager.getAIConfig();
     if (aiConfig.enabled) {
-      songloft.log.info(`[VoiceEngine] [AI] Analyzing query="${query}"`);
-      const aiResult = await this.aiAnalyzer.analyze(query, aiConfig);
-      if (aiResult) {
-        songloft.log.info(`[VoiceEngine] [AI] Done: action=${aiResult.action} confidence=${aiResult.confidence} params=${JSON.stringify(aiResult.params)}`);
-        if (aiResult.confidence !== 'low' && aiResult.action !== 'unknown') {
-          songloft.log.info(`[VoiceEngine] [AI] → Executing fallback (high confidence, action=${aiResult.action})`);
-          const playedSong = await this.executeAIResult(aiResult, accountId, msg.device_id);
-          if (memoryEnabled && (aiResult.action === 'play_song' || aiResult.action === 'play_artist') && playedSong) {
-            this.queueMemorySuccess(query, playedSong);
-          }
+      // 1) 问答：以"请问"等触发词发起 → DeepSeek 直接回答并 TTS 念出
+      if (QA_TRIGGER_PATTERN.test(query)) {
+        songloft.log.info(`[VoiceEngine] [QA] Triggered query="${query}"`);
+        const reply = await this.aiAnalyzer.analyzeChat(query, aiConfig);
+        if (reply) {
+          songloft.log.info(`[VoiceEngine] [QA] Replying: "${reply.slice(0, 80)}"`);
+          await this.minaService.textToSpeech(accountId, msg.device_id, reply);
           return;
         }
-        songloft.log.info(`[VoiceEngine] [AI] → No fallback execution (action=${aiResult.action}, confidence=${aiResult.confidence})`);
+        songloft.log.warn('[VoiceEngine] [QA] analyzeChat returned null, fall through');
+      }
+      // 2) 播放意图 → AI 音乐指令解析
+      if (PLAY_TRIGGER_PATTERN.test(query)) {
+        songloft.log.info(`[VoiceEngine] [AI] Analyzing query="${query}"`);
+        const aiResult = await this.aiAnalyzer.analyze(query, aiConfig);
+        if (aiResult) {
+          songloft.log.info(`[VoiceEngine] [AI] Done: action=${aiResult.action} confidence=${aiResult.confidence} params=${JSON.stringify(aiResult.params)}`);
+          if (aiResult.confidence !== 'low' && aiResult.action !== 'unknown') {
+            songloft.log.info(`[VoiceEngine] [AI] → Executing fallback (high confidence, action=${aiResult.action})`);
+            const playedSong = await this.executeAIResult(aiResult, accountId, msg.device_id);
+            if (memoryEnabled && (aiResult.action === 'play_song' || aiResult.action === 'play_artist') && playedSong) {
+              this.queueMemorySuccess(query, playedSong);
+            }
+            return;
+          }
+          songloft.log.info(`[VoiceEngine] [AI] → No fallback execution (action=${aiResult.action}, confidence=${aiResult.confidence})`);
+        } else {
+          songloft.log.info(`[VoiceEngine] [AI] → No fallback execution (analyze returned null)`);
+        }
       } else {
-        songloft.log.info(`[VoiceEngine] [AI] → No fallback execution (analyze returned null)`);
+        songloft.log.info(`[VoiceEngine] [AI] Skipped (not QA/play intent): "${query}"`);
       }
     }
 
-    // 任何语音交互都会唤醒音箱并打断 URL 播放。
-    // 立即挂起定时器（防止 AI 响应期间触发切歌），等小爱说完后重新推送歌曲 URL。
+    // 非播放/非问答的语音（智能家居、唤醒词等）：挂起切歌定时器即可，不自动恢复播放，
+    // 避免"调完空调/喊完小爱，音箱莫名自己又开始播"。
     const pm = this.playlistManagerMap.get(accountId, msg.device_id);
     if (pm && pm.isPlaying()) {
       pm.suspendForVoiceInteraction();
-      songloft.log.info('[VoiceEngine] Unmatched command while playing, scheduling smart resume');
-      this.scheduleSmartResume(pm, accountId, msg.device_id);
+      songloft.log.info('[VoiceEngine] Unmatched non-play command, suspending timer only (no auto resume)');
     }
   }
 
