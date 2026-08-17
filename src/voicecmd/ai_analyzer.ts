@@ -295,6 +295,8 @@ export class AIAnalyzer {
         .replace(/`/g, '')
         .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1') // markdown 链接只留文字
         .replace(/^#{1,6}\s+/gm, '')
+        .replace(/[\r\n]+/g, '')               // 去换行：否则分段只按句号断、整块塞一段且 TTS 念出换行
+        .replace(/\s*[-*]\s+/g, '')            // 去 markdown 列表符号，避免念出破折号
         .trim()
         .replace(/^["'“”]+|["'“”]+$/g, '')
         .slice(0, 120);

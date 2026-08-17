@@ -43,16 +43,23 @@ function splitTtsSegments(text: string, maxLen = 30): string[] {
   const pieces = text.match(/[^。！？!?；;]+[。！？!?；;]?/g) || [text];
   const segments: string[] = [];
   let cur = '';
+  const flush = () => { if (cur.trim()) segments.push(cur.trim()); cur = ''; };
   for (const p of pieces) {
     if ((cur + p).length <= maxLen) {
       cur += p;
-    } else {
-      if (cur) segments.push(cur);
-      cur = p;
+      continue;
     }
+    // 当前段装不下 → 先落盘;若 p 本身超长(如整段无句末标点),按 maxLen 硬切,避免长文本 TTS 读一半断
+    flush();
+    let rest = p;
+    while (rest.length > maxLen) {
+      segments.push(rest.slice(0, maxLen).trim());
+      rest = rest.slice(maxLen);
+    }
+    cur = rest;
   }
-  if (cur) segments.push(cur);
-  return segments.map(s => s.trim()).filter(Boolean);
+  flush();
+  return segments;
 }
 
 /** 口令匹配结果 */
@@ -444,7 +451,13 @@ export class VoiceEngine {
           const pm = this.playlistManagerMap.get(accountId, msg.device_id);
           const segments = (pm && pm.isPlaying()) ? [labeled] : splitTtsSegments(labeled);
           for (let i = 0; i < segments.length; i++) {
-            if (i > 0) await new Promise(r => setTimeout(r, 800));
+            if (i > 0) {
+              // 等上一段念完再发下一段，否则后段会打断前段。
+              // 优先轮询设备播放状态精确检测（status 从 playing=1 回到非 1 即念完）；
+              // 空闲 TTS 若不改播放状态则退化为按字数估算兜底（见 waitForTtsFinish）
+              songloft.log.info(`[VoiceEngine] [QA] Segment ${i + 1}/${segments.length}: waiting for previous (len=${segments[i - 1].length}) to finish`);
+              await this.waitForTtsFinish(accountId, msg.device_id, segments[i - 1].length);
+            }
             await this.minaService.textToSpeech(accountId, msg.device_id, segments[i]);
           }
           return;
@@ -2135,6 +2148,42 @@ export class VoiceEngine {
         await new Promise(r => setTimeout(r, estimatedMs));
         break;
       }
+    }
+  }
+
+  /**
+   * 等音箱把当前 TTS 播报念完（QA 分段用，空闲场景）。
+   * 优先轮询设备播放状态：观察到 playing(status=1) 后回到非 1 即精确判定念完；
+   * 若空闲 TTS 从头到尾不改 status（一直 0），说明无法用播放状态检测，
+   * 退化为按字数估算兜底（中文 TTS 约 280ms/字 + 800ms 缓冲），保证不打断下一段。
+   */
+  private async waitForTtsFinish(accountId: string, deviceId: string, textLength: number): Promise<void> {
+    const estimatedMs = textLength * 280 + 800;
+    const maxWaitMs = Math.min(estimatedMs + 3000, 20000);
+    const startTime = Date.now();
+    await new Promise(r => setTimeout(r, 800));   // 留出发送延迟，让音箱开始念
+    let sawPlaying = false;
+    let lastStatus = -2;
+    while (Date.now() - startTime < maxWaitMs) {
+      const { status } = await this.minaService.getPlayState(accountId, deviceId);
+      if (status !== lastStatus) {
+        songloft.log.info(`[VoiceEngine] [QA] TTS poll: status=${status} (sawPlaying=${sawPlaying})`);
+        lastStatus = status;
+      }
+      if (status === 1) sawPlaying = true;
+      if (sawPlaying && status !== 1) break;       // 念完：从 playing 回到非 playing
+      if (status === -1) break;                    // 状态不可得，别再空轮询
+      await new Promise(r => setTimeout(r, 500));
+    }
+    if (!sawPlaying) {
+      // 空闲 TTS 不改播放状态 → poll 检测不到，按估算补足剩余等待
+      const remain = Math.max(0, estimatedMs - (Date.now() - startTime));
+      if (remain > 0) {
+        songloft.log.info(`[VoiceEngine] [QA] TTS poll saw no playing, fallback to estimate +${Math.round(remain / 1000)}s`);
+        await new Promise(r => setTimeout(r, remain));
+      }
+    } else {
+      songloft.log.info('[VoiceEngine] [QA] TTS segment finished (device idle again)');
     }
   }
 
