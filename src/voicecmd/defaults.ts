@@ -15,6 +15,8 @@ export function getDefaultVoiceCommands(): VoiceCommand[] {
     { type: 'set_volume', keywords: ['小声一点', '声音小一点', '音量小一点', '小点声'], param: 'down', enabled: true },
     { type: 'next', keywords: ['下一首', '切歌', '换一首', '下一曲'], enabled: true },
     { type: 'previous', keywords: ['上一首', '上一曲'], enabled: true },
+    // 注意不含裸"继续"：会撞多轮 QA 续接（"继续详细说明"）。只用明确续播短语。
+    { type: 'resume', keywords: ['继续播放', '接着播放', '继续放歌', '继续放'], enabled: true },
     { type: 'stop', keywords: ['暂停播放', '停止播放', '暂停音乐', '停一下', 'pause', 'stop', '停止', '别播了', '关掉音乐', '关机', '关闭', '暂停'], enabled: true },
     { type: 'favorite', keywords: ['收藏歌曲', '收藏这首歌', '喜欢这首歌', '收藏这首'], param: 'add', enabled: true },
     { type: 'favorite', keywords: ['取消收藏', '取消收藏歌曲'], param: 'remove', enabled: true },

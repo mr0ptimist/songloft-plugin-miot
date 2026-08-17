@@ -160,7 +160,7 @@ const INDEX_READY_WAIT_MS = 5000;
 /** 本地独立歌曲 URL 健康检查超时（ms），利用 TTS 播报窗口期异步验证，不增加用户感知延迟。 */
 const URL_HEALTH_CHECK_TIMEOUT_MS = 3000;
 
-const FIXED_CONTROL_COMMAND_TYPES = new Set(['set_play_mode', 'set_volume', 'favorite', 'next', 'previous', 'stop', 'sleep_timer', 'cancel_sleep_timer', 'query_sleep_timer']);
+const FIXED_CONTROL_COMMAND_TYPES = new Set(['set_play_mode', 'set_volume', 'favorite', 'next', 'previous', 'stop', 'resume', 'sleep_timer', 'cancel_sleep_timer', 'query_sleep_timer']);
 const SEARCH_COMMAND_TYPES = new Set(['play_song', 'play_playlist', 'play_artist']);
 const BUILTIN_STOP_KEYWORDS = ['暂停播放', '停止播放', '暂停音乐', '停一下', 'pause', 'stop', '暂停'];
 
@@ -325,6 +325,15 @@ export class VoiceEngine {
     const query = this.extractQuery(msg);
     if (!query || query.trim() === '') {
       return;
+    }
+
+    // 通知宿主"用户刚发指令"：真实语音走 ConversationMonitor 轮询进到这里，
+    // 不经过宿主 HandleMessage，动态 ticker 收不到活动信号会一直卡慢节奏。
+    // fire-and-forget：桥接 goroutine 同步更新 lastUserActivity，Promise 由下个 pump 解决。
+    // （songloft.plugin.signalActivity 为宿主 fork 新增桥接，SDK 类型尚未跟进，故 as any）
+    const sa = (songloft.plugin as any).signalActivity;
+    if (typeof sa === 'function') {
+      sa.call(songloft.plugin).catch(() => {});
     }
 
     // 小爱自己的回答文本（用于问答时估算"小爱说完"再让 DeepSeek 切入，避免两条回答重叠/突兀）
@@ -964,6 +973,9 @@ export class VoiceEngine {
       case 'previous':
         await this.executePrevious(accountId, deviceId);
         break;
+      case 'resume':
+        await this.executeResume(accountId, deviceId);
+        break;
       case 'stop':
         await this.executeStop(accountId, deviceId);
         break;
@@ -1001,7 +1013,10 @@ export class VoiceEngine {
         const name = result.params.name || '';
         const artist = result.params.artist || '';
         if (!name && !artist) {
-          songloft.log.warn('[VoiceEngine] [AI] play_song: no name or artist to play');
+          // 空参数：DeepSeek 常把"继续播放"之类猜成 play_song 空参，直接本地续播兜底，
+          // 而不是 WARN 死路（此前该分支什么都不做）。
+          songloft.log.info('[VoiceEngine] [AI] play_song empty, resuming last playback');
+          await this.executeResume(accountId, deviceId);
           return null;
         }
         // 歌名+歌手都有：歌名作主搜索词、歌手作辅助字段（多字段 cover 匹配）；
@@ -1900,6 +1915,26 @@ export class VoiceEngine {
     const pm = await this.playlistManagerMap.getOrCreate(accountId, deviceId);
     await pm.stop();
     songloft.log.info(`[VoiceEngine] Playback stopped`);
+  }
+
+  /**
+   * 执行继续播放：从上次位置恢复（用 play 接口续，不重推 URL）。
+   * "继续播放" 是高频口令，必须本地固定匹配，不能漏给 DeepSeek
+   * （DeepSeek 常把它猜成 play_song 空参数，进而走 WARN 死路）。
+   */
+  private async executeResume(accountId: string, deviceId: string): Promise<void> {
+    this.cancelPendingResume();
+    const pm = await this.playlistManagerMap.getOrCreate(accountId, deviceId);
+    if (!pm.hasPlaylist()) {
+      songloft.log.info('[VoiceEngine] Resume: no active playlist');
+      return;
+    }
+    if (pm.isPlaying()) {
+      songloft.log.info('[VoiceEngine] Resume: already playing, skip');
+      return;
+    }
+    const ok = await pm.resumePlayback();
+    songloft.log.info(`[VoiceEngine] Resume playback: ${ok ? 'ok' : 'failed'}`);
   }
 
   /**
