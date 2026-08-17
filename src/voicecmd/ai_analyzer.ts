@@ -50,8 +50,8 @@ const AI_SYSTEM_PROMPT = `从指令中提取出操作和音乐信息，返回JSO
 /** AI 问答 System Prompt（仅在用户以"请问"等触发词发起问答时使用） */
 const AI_CHAT_SYSTEM_PROMPT = `你是智能音箱里的 AI 助手（小爱同学）。用中文简洁、准确地回答用户的问题，不超过80字。不要提到"我无法""我不能"等推脱，直接给出答案；不确定就说"我不确定"。`;
 
-/** 任务桥工具声明：LLM 可自主决定调用（走 songloft 任务桥执行） */
-const BRIDGE_TOOLS = [{
+/** 内置兜底工具声明：桥 /tools 拉取失败时保底用（正常时工具由桥动态下发，加任务无需改插件） */
+const BUILTIN_BRIDGE_TOOLS = [{
   type: 'function',
   function: {
     name: 'query_usage',
@@ -79,6 +79,21 @@ const BRIDGE_TOOLS = [{
         hours: {
           type: 'integer',
           description: '查询最近多少小时的功耗, 默认24, 最大168',
+        },
+      },
+    },
+  },
+}, {
+  type: 'function',
+  function: {
+    name: 'query_power_top',
+    description: '查询服务器 Mac 上哪些程序占耗电/CPU最高。hours 缺省或0=实时查询当前; 传小时数=查询该时段历史平均排行',
+    parameters: {
+      type: 'object',
+      properties: {
+        hours: {
+          type: 'integer',
+          description: '0或缺省=实时查当前; 1-168=查询最近N小时的历史平均排行',
         },
       },
     },
@@ -263,8 +278,8 @@ export class AIAnalyzer {
         ...(history || []),
         { role: 'user', content: query },
       ];
-      // 配置了任务桥时启用工具调用：LLM 可自主决定调 query_usage / query_power 等桥任务
-      const tools = (config.bridge_url && config.bridge_token) ? BRIDGE_TOOLS : undefined;
+      // 配置了任务桥时启用工具调用：工具声明优先从桥动态拉取（加任务无需改插件），失败回退内置
+      const tools = await this.getBridgeTools(config);
 
       let res = await this.callLLMMessages(messages, config, { tools });
       // 工具调用循环：执行桥任务 → 回填 tool 结果 → 再调 LLM（最多 3 轮防死循环）
@@ -307,9 +322,38 @@ export class AIAnalyzer {
     }
   }
 
+  /** 桥动态工具声明缓存（fetch /tools 的结果，10 分钟有效） */
+  private static bridgeToolsCache: { tools: Array<{ type: string; function: Record<string, unknown> }>; ts: number } | null = null;
+
   /**
-   * 执行任务桥工具：POST {bridge_url}/run {task: which}，返回结果文本
-   * 桥在服务器宿主机（songloft-bridge），凭据/脚本都在服务器，全部本地执行
+   * 获取任务桥工具声明：优先 GET {bridge_url}/tools 动态下发（服务器 tasks/ 加任务即生效），
+   * 拉取失败或为空时回退内置声明保底（桥挂了旧功能照常）。未配置桥返回 undefined。
+   */
+  private async getBridgeTools(config: AIConfig): Promise<unknown[] | undefined> {
+    if (!config.bridge_url || !config.bridge_token) return undefined;
+    const now = Date.now();
+    if (AIAnalyzer.bridgeToolsCache && now - AIAnalyzer.bridgeToolsCache.ts < 10 * 60 * 1000) {
+      return AIAnalyzer.bridgeToolsCache.tools;
+    }
+    try {
+      const resp = await fetch(`${config.bridge_url}/tools`, {
+        headers: { 'X-Bridge-Token': config.bridge_token },
+      });
+      const data = await resp.json() as { tools?: Array<{ type: string; function: Record<string, unknown> }> };
+      if (Array.isArray(data.tools) && data.tools.length > 0) {
+        AIAnalyzer.bridgeToolsCache = { tools: data.tools, ts: now };
+        return data.tools;
+      }
+      songloft.log.warn(`[AIAnalyzer] bridge /tools returned empty, fallback to builtin`);
+    } catch (e) {
+      songloft.log.warn(`[AIAnalyzer] fetch bridge /tools failed, fallback to builtin: ${String(e)}`);
+    }
+    return [...BUILTIN_BRIDGE_TOOLS];
+  }
+
+  /**
+   * 执行任务桥工具：POST {bridge_url}/run {task, args}，返回结果文本
+   * 桥在服务器宿主机（songloft-bridge），任务脚本都在服务器，白名单+进程隔离执行
    */
   private async executeBridgeTool(tc: AIToolCall, config: AIConfig): Promise<string> {
     // 桥任务名 = 工具参数 which(旧 query_usage 语义),缺省用工具名;args 原样透传
