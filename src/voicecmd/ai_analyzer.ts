@@ -50,8 +50,8 @@ const AI_SYSTEM_PROMPT = `从指令中提取出操作和音乐信息，返回JSO
 /** AI 问答 System Prompt（仅在用户以"请问"等触发词发起问答时使用） */
 const AI_CHAT_SYSTEM_PROMPT = `你是智能音箱里的 AI 助手（小爱同学）。用中文简洁、准确地回答用户的问题，不超过80字。不要提到"我无法""我不能"等推脱，直接给出答案；不确定就说"我不确定"。`;
 
-/** 任务桥工具声明：LLM 可自主决定调用 query_usage 查询账户余额/用量（走 songloft 任务桥执行） */
-const USAGE_TOOLS = [{
+/** 任务桥工具声明：LLM 可自主决定调用（走 songloft 任务桥执行） */
+const BRIDGE_TOOLS = [{
   type: 'function',
   function: {
     name: 'query_usage',
@@ -66,6 +66,21 @@ const USAGE_TOOLS = [{
         },
       },
       required: ['which'],
+    },
+  },
+}, {
+  type: 'function',
+  function: {
+    name: 'query_power',
+    description: '查询服务器 Mac mini 最近一段时间的功耗情况（CPU/整机平均、峰值功耗）',
+    parameters: {
+      type: 'object',
+      properties: {
+        hours: {
+          type: 'integer',
+          description: '查询最近多少小时的功耗, 默认24, 最大168',
+        },
+      },
     },
   },
 }] as const;
@@ -248,8 +263,8 @@ export class AIAnalyzer {
         ...(history || []),
         { role: 'user', content: query },
       ];
-      // 配置了任务桥时启用工具调用：LLM 可自主决定调 query_usage 查询余额/用量
-      const tools = (config.bridge_url && config.bridge_token) ? USAGE_TOOLS : undefined;
+      // 配置了任务桥时启用工具调用：LLM 可自主决定调 query_usage / query_power 等桥任务
+      const tools = (config.bridge_url && config.bridge_token) ? BRIDGE_TOOLS : undefined;
 
       let res = await this.callLLMMessages(messages, config, { tools });
       // 工具调用循环：执行桥任务 → 回填 tool 结果 → 再调 LLM（最多 3 轮防死循环）
@@ -295,7 +310,8 @@ export class AIAnalyzer {
    * 桥在服务器宿主机（songloft-bridge），凭据/脚本都在服务器，全部本地执行
    */
   private async executeBridgeTool(tc: AIToolCall, config: AIConfig): Promise<string> {
-    const which = String(tc.args?.which || '');
+    // 桥任务名 = 工具参数 which(旧 query_usage 语义),缺省用工具名;args 原样透传
+    const task = String(tc.args?.which || tc.name || '');
     if (!config.bridge_url) return '（未配置任务桥）';
     try {
       const resp = await fetch(`${config.bridge_url}/run`, {
@@ -304,7 +320,7 @@ export class AIAnalyzer {
           'Content-Type': 'application/json',
           'X-Bridge-Token': config.bridge_token || '',
         },
-        body: JSON.stringify({ task: which }),
+        body: JSON.stringify({ task, args: tc.args || {} }),
       });
       const data = await resp.json() as { ok?: boolean; result?: unknown; error?: string };
       if (data.ok) return String(data.result ?? '');
