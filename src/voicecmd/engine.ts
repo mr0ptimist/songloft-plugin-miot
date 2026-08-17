@@ -40,25 +40,37 @@ const PLAY_TRIGGER_PATTERN = /播放|放一首|放个|放首|放一下|我想听
  * 拆短句逐段念更稳；但播放中不分段（多条 TTS 反复打断播放是播放故障元凶）。
  */
 function splitTtsSegments(text: string, maxLen = 30): string[] {
-  const pieces = text.match(/[^。！？!?；;]+[。！？!?；;]?/g) || [text];
+  const sentences = text.match(/[^。！？!?；;]+[。！？!?；;]?/g) || [text];
   const segments: string[] = [];
   let cur = '';
-  const flush = () => { if (cur.trim()) segments.push(cur.trim()); cur = ''; };
-  for (const p of pieces) {
-    if ((cur + p).length <= maxLen) {
-      cur += p;
-      continue;
+  const flush = () => { const t = cur.trim(); if (t) segments.push(t); cur = ''; };
+  for (const s of sentences) {
+    // 子句只在全角冒号断句：ASCII ':' 是时间(21:39)分隔符，不能当子句边界（否则时间被切开）
+    const clauses = s.match(/[^，,、：]+[，,、：]?/g) || [s];
+    for (const c of clauses) {
+      if ((cur + c).length <= maxLen) { cur += c; continue; }
+      flush();
+      if (c.length <= maxLen) { cur = c; continue; }
+      let rest = c;
+      while (rest.length > maxLen) {
+        let cut = maxLen;
+        // 硬切保护：切点落在数字成分(含小数点/百分号/时间冒号)上时回退，
+        // 数字+单位(0.36瓦/21:39/0.46W)不拆开--否则用户听到"…0.36"(顿)"瓦，…"
+        while (cut > 1 && /[0-9.%％:]/.test(rest[cut - 1])) cut--;
+        segments.push(rest.slice(0, cut).trim());
+        rest = rest.slice(cut);
+      }
+      cur = rest;
     }
-    // 当前段装不下 → 先落盘;若 p 本身超长(如整段无句末标点),按 maxLen 硬切,避免长文本 TTS 读一半断
-    flush();
-    let rest = p;
-    while (rest.length > maxLen) {
-      segments.push(rest.slice(0, maxLen).trim());
-      rest = rest.slice(maxLen);
-    }
-    cur = rest;
   }
   flush();
+  // 尾段太短(≤2字)时并入前段，避免孤零零一个字单独念（≤33 仍在 MiIO 安全长度内，实测 35 字正常）
+  const last = segments[segments.length - 1];
+  if (segments.length >= 2 && last && last.length <= 2 &&
+      segments[segments.length - 2].length + last.length <= maxLen + 3) {
+    segments[segments.length - 2] += last;
+    segments.pop();
+  }
   return segments;
 }
 
@@ -447,9 +459,15 @@ export class VoiceEngine {
             await this.minaService.textToSpeech(accountId, msg.device_id, PROMPT_MSG);
             await new Promise(r => setTimeout(r, 1800));
           }
-          // 空闲（未播放音乐）时拆短句分段念，治长文本 TTS 重读；播放中只整段念，避免多条 TTS 打断播放
+          // 空闲（未播放音乐）时拆短句分段念，治长文本 TTS 重读；播放中只整段念，避免多条 TTS 打断播放。
+          // ⚠️ 播放判定必须加设备真实状态：pm.isPlaying() 只反映插件自管播放，音箱原生队列在播时它是
+          // false——2026-08-17 用户实测：音乐在播但插件认为空闲 -> 问答被分段，多条 TTS 与音乐互相打断
           const pm = this.playlistManagerMap.get(accountId, msg.device_id);
-          const segments = (pm && pm.isPlaying()) ? [labeled] : splitTtsSegments(labeled);
+          let devicePlaying = false;
+          try {
+            devicePlaying = (await this.minaService.getPlayState(accountId, msg.device_id)).status === 1;
+          } catch { /* 状态查询失败按空闲处理 */ }
+          const segments = (devicePlaying || (pm && pm.isPlaying())) ? [labeled] : splitTtsSegments(labeled);
           for (let i = 0; i < segments.length; i++) {
             if (i > 0) {
               // 等上一段念完再发下一段，否则后段会打断前段。
