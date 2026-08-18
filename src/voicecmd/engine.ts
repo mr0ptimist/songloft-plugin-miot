@@ -22,7 +22,7 @@ import type { PlaylistManager } from '../player/manager';
 import type { SongLocation, ArtistSongLocation } from '../indexing/manager';
 import type { MemoryRecord } from '../memory';
 import type { OnlineSearchResult } from './online_searcher';
-import type { ConversationMessage, VoiceCommand, PlayMode, AIAnalysisResult, SearchPriority } from '../types';
+import type { ConversationMessage, VoiceCommand, PlayMode, AIAnalysisResult, SearchPriority, AIConfig } from '../types';
 import { getDefaultVoiceCommands } from './defaults';
 export { getDefaultVoiceCommands } from './defaults';
 
@@ -467,16 +467,22 @@ export class VoiceEngine {
           try {
             devicePlaying = (await this.minaService.getPlayState(accountId, msg.device_id)).status === 1;
           } catch { /* 状态查询失败按空闲处理 */ }
-          const segments = (devicePlaying || (pm && pm.isPlaying())) ? [labeled] : splitTtsSegments(labeled);
-          for (let i = 0; i < segments.length; i++) {
-            if (i > 0) {
-              // 等上一段念完再发下一段，否则后段会打断前段。
-              // 优先轮询设备播放状态精确检测（status 从 playing=1 回到非 1 即念完）；
-              // 空闲 TTS 若不改播放状态则退化为按字数估算兜底（见 waitForTtsFinish）
-              songloft.log.info(`[VoiceEngine] [QA] Segment ${i + 1}/${segments.length}: waiting for previous (len=${segments[i - 1].length}) to finish`);
-              await this.waitForTtsFinish(accountId, msg.device_id, segments[i - 1].length);
+          // 长文本播报优先走"音频 URL"（本地 edge-tts 合成整段 mp3 → player_play_url 当媒体播放），
+          // 彻底绕过小爱 textToSpeech 的 35 字截断（长回答念几个字就被切、播报不完整）。
+          // 短文本 / 桥不可用 / 合成或播放失败时回退分段 textToSpeech，功能不劣化。
+          const audioPlayed = await this.tryPlayAsAudio(accountId, msg.device_id, labeled, aiConfig);
+          if (!audioPlayed) {
+            const segments = (devicePlaying || (pm && pm.isPlaying())) ? [labeled] : splitTtsSegments(labeled);
+            for (let i = 0; i < segments.length; i++) {
+              if (i > 0) {
+                // 等上一段念完再发下一段，否则后段会打断前段。
+                // 优先轮询设备播放状态精确检测（status 从 playing=1 回到非 1 即念完）；
+                // 空闲 TTS 若不改播放状态则退化为按字数估算兜底（见 waitForTtsFinish）
+                songloft.log.info(`[VoiceEngine] [QA] Segment ${i + 1}/${segments.length}: waiting for previous (len=${segments[i - 1].length}) to finish`);
+                await this.waitForTtsFinish(accountId, msg.device_id, segments[i - 1].length);
+              }
+              await this.minaService.textToSpeech(accountId, msg.device_id, segments[i]);
             }
-            await this.minaService.textToSpeech(accountId, msg.device_id, segments[i]);
           }
           return;
         }
@@ -2167,6 +2173,92 @@ export class VoiceEngine {
         break;
       }
     }
+  }
+
+  /**
+   * 长文本播报改走"音频 URL"（绕过小爱 textToSpeech 的 35 字截断）：
+   * 1) 调任务桥 tts_url 任务，本地 edge-tts 把整段文本合成 mp3 并返回音箱可访问的 HTTP URL + 时长；
+   * 2) 用 player_play_url / player_play_music 把 mp3 当媒体播放（不受文本 TTS 长度限制，播报完整）；
+   * 3) 轮询设备状态等播完（见 waitForAudioFinish），必要时按时长强制停，防止短音频被小爱当待输入重播。
+   *
+   * 来源：xiaomusic(edge-tts+时长定时停) / xiaogpt(本地合成→play_by_url) / Xiaoai-Claw-Addon(音频relay+起播验证)。
+   * 返回 true=已用音频完整播完；false=条件不满足或失败，调用方回退分段 textToSpeech（功能不劣化）。
+   */
+  private async tryPlayAsAudio(accountId: string, deviceId: string, text: string, aiConfig: AIConfig): Promise<boolean> {
+    // 短文本不值得本地合成（开销 > 收益），继续走轻量 textToSpeech
+    if (text.length <= 20) return false;
+    if (!aiConfig.bridge_url || !aiConfig.bridge_token) return false;
+    let url = '';
+    let durationSec = 0;
+    try {
+      const resp = await fetch(`${aiConfig.bridge_url}/run`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Bridge-Token': aiConfig.bridge_token },
+        body: JSON.stringify({ task: 'tts_url', args: { text } }),
+      });
+      const data = (await resp.json()) as { ok: boolean; result?: string; error?: string };
+      if (!data.ok || !data.result) {
+        songloft.log.warn(`[VoiceEngine] [QA] tts_url task failed, fallback to segment TTS: ${data.error || 'no result'}`);
+        return false;
+      }
+      const parsed = JSON.parse(data.result) as { url?: string; duration_sec?: number };
+      url = parsed.url || '';
+      durationSec = parsed.duration_sec || Math.ceil(text.length / 4.5);
+      if (!url) return false;
+    } catch (e) {
+      songloft.log.warn(`[VoiceEngine] [QA] tts_url bridge call failed, fallback to segment TTS: ${String(e)}`);
+      return false;
+    }
+    try {
+      songloft.log.info(`[VoiceEngine] [QA] audio announce via URL: "${text.slice(0, 30)}..." len=${text.length} dur=${durationSec}s`);
+      const ok = await this.minaService.playURL(accountId, deviceId, url);
+      if (!ok) {
+        songloft.log.warn('[VoiceEngine] [QA] audio announce playURL failed, fallback to segment TTS');
+        return false;
+      }
+      await this.waitForAudioFinish(accountId, deviceId, durationSec);
+      return true;
+    } catch (e) {
+      songloft.log.warn(`[VoiceEngine] [QA] audio announce playback error, fallback to segment TTS: ${String(e)}`);
+      return false;
+    }
+  }
+
+  /**
+   * 等音箱把音频 URL 播报播完（QA 长播报用）。
+   * 优先轮询设备播放状态（status 从 playing=1 回到非 1 即播完）；
+   * 若一直检测不到 playing，按时长估算（duration + 2s 缓存缓冲，参考 xiaomusic）补足等待。
+   * 收尾强制 stop 一次：部分场景 mp3 播完音箱仍停在"播放中"（短音频会被小爱当待输入重播），
+   * 主动停掉避免挂在播放态、也避免污染后续操作。
+   */
+  private async waitForAudioFinish(accountId: string, deviceId: string, durationSec: number): Promise<void> {
+    const maxWaitMs = Math.min((durationSec + 2) * 1000, 30000);
+    const startTime = Date.now();
+    await new Promise(r => setTimeout(r, 1200));   // 留出发送/起播延迟
+    let sawPlaying = false;
+    let lastStatus = -2;
+    while (Date.now() - startTime < maxWaitMs) {
+      const { status } = await this.minaService.getPlayState(accountId, deviceId);
+      if (status !== lastStatus) {
+        songloft.log.info(`[VoiceEngine] [QA] audio poll: status=${status} (sawPlaying=${sawPlaying})`);
+        lastStatus = status;
+      }
+      if (status === 1) sawPlaying = true;
+      if (sawPlaying && status !== 1) break;        // 播完：从 playing 回到非 playing
+      if (status === -1) break;                     // 状态不可得，别再空轮询
+      await new Promise(r => setTimeout(r, 500));
+    }
+    if (!sawPlaying) {
+      // 没观察到 playing：按时长估算补足剩余等待，保证播报不被后续动作打断
+      const remain = Math.max(0, maxWaitMs - (Date.now() - startTime));
+      if (remain > 0) {
+        songloft.log.info(`[VoiceEngine] [QA] audio poll saw no playing, wait by duration +${Math.round(remain / 1000)}s`);
+        await new Promise(r => setTimeout(r, remain));
+      }
+    }
+    try {
+      await this.minaService.stopPlay(accountId, deviceId);
+    } catch { /* 停不掉不致命，下一条操作会再覆盖 */ }
   }
 
   /**
