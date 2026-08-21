@@ -35,6 +35,14 @@ const QA_TRIGGER_PATTERN = /请问|问一下|问个问题|回答我|帮我答/;
 const PLAY_TRIGGER_PATTERN = /播放|放一首|放个|放首|放一下|我想听|来一首|来几首|来首|点一首|听一下|听首歌|听个|播一下|随机播/;
 
 /**
+ * 纯唤醒词：用户唤醒音箱的"小爱/小爱同学"等口令。小爱已原生响应，插件不该处理。
+ * 否则会走"非播放/非问答"分支的 suspendForVoiceInteraction() 把自动切歌定时器清掉
+ * （stopCheckTimer 且永不恢复），正在播的歌"只播一首、不自动切歌"——2026-08-22 实测：
+ * 播放 Taylor 的 Timer 注册后 0.01s 被随后的"小爱"唤醒词清掉。
+ */
+const WAKE_WORD_PATTERN = /^(小爱|小爱同学|你好小爱|小爱你好|小爱小爱|嘿小爱)([，。!！?？\s]*)$/;
+
+/**
  * 将回答拆成 ≤maxLen 字的短句分段，优先在句末标点处断句。
  * 仅用于空闲（未播放音乐）时的问答：MiIO 长文本 TTS 偶发"读一半断/重复念多遍"，
  * 拆短句逐段念更稳；但播放中不分段（多条 TTS 反复打断播放是播放故障元凶）。
@@ -346,6 +354,14 @@ export class VoiceEngine {
       return;
     }
 
+    // 纯唤醒词（"小爱/小爱同学"等）：小爱已原生响应，直接跳过。
+    // 处理它们会走非播放/非问答分支的 suspendForVoiceInteraction()，
+    // 把正在播放的音乐的自动切歌定时器清掉且永不恢复（"只播放一首"）。
+    if (WAKE_WORD_PATTERN.test(query.trim())) {
+      songloft.log.info(`[VoiceEngine] Wake word, skip: "${query}"`);
+      return;
+    }
+
     // 通知宿主"用户刚发指令"：真实语音走 ConversationMonitor 轮询进到这里，
     // 不经过宿主 HandleMessage，动态 ticker 收不到活动信号会一直卡慢节奏。
     // fire-and-forget：桥接 goroutine 同步更新 lastUserActivity，Promise 由下个 pump 解决。
@@ -511,13 +527,13 @@ export class VoiceEngine {
       }
     }
 
-    // 非播放/非问答的语音（智能家居、唤醒词等）：挂起切歌定时器即可，不自动恢复播放，
-    // 避免"调完空调/喊完小爱，音箱莫名自己又开始播"。
-    const pm = this.playlistManagerMap.get(accountId, msg.device_id);
-    if (pm && pm.isPlaying()) {
-      pm.suspendForVoiceInteraction();
-      songloft.log.info('[VoiceEngine] Unmatched non-play command, suspending timer only (no auto resume)');
-    }
+    // 非播放/非问答的语音（智能家居、闲聊、唤醒等）：不打断正在播放的音乐。
+    // 旧实现 suspendForVoiceInteraction() 会 stopCheckTimer 清掉自动切歌定时器
+    // 且永不恢复——正在播的歌"只播放一首、不自动切歌"（2026-08-22 实测：
+    // play_artist 注册 Timer 后 0.01s 被随后的"小爱"唤醒词清掉）。
+    // 音乐本来就在播，用户喊完其它话理应继续自动播；真停了播放（isPlaying=false）
+    // 时这里本就不该有动作，所以直接不再挂起定时器。
+    // （suspendForVoiceInteraction 仍保留给 smartResume / QA 等明确要暂停的流程用）
   }
 
   /**
