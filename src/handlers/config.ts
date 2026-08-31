@@ -10,7 +10,7 @@ import { VoiceEngine } from '../voicecmd/engine';
 import { normalizeMemoryMaxRecords } from '../memory';
 import type { MemoryService } from '../memory';
 import { setHostBaseUrl, callHostAPI } from '../utils/http';
-import { setPollDebug } from '../utils/debug';
+import { setPollDebug, setVerbose } from '../utils/debug';
 import type { SearchPriority } from '../types';
 
 const SEARCH_PRIORITIES: SearchPriority[] = ['parallel', 'local_first', 'external_first'];
@@ -113,6 +113,7 @@ export function registerConfigHandlers(
           play_announcement_delay: config.play_announcement_delay ?? 3,
           conversation_poll_interval: config.conversation_poll_interval ?? 1,
           conversation_poll_debug: !!config.conversation_poll_debug,
+          verbose_log: !!config.verbose_log,
           smart_resume_timeout: config.smart_resume_timeout ?? 30,
           max_song_index: config.max_song_index ?? 10000,
           server_host_status: getServerHostStatus(config.server_host),
@@ -312,6 +313,12 @@ export function registerConfigHandlers(
       if (body.conversation_poll_debug !== undefined) {
         config.conversation_poll_debug = !!body.conversation_poll_debug;
         setPollDebug(config.conversation_poll_debug);
+      }
+
+      // 更新 verbose_log（详细日志总开关，同步到 debug 模块缓存）
+      if (body.verbose_log !== undefined) {
+        config.verbose_log = !!body.verbose_log;
+        setVerbose(config.verbose_log);
       }
 
       // 更新 smart_resume_timeout

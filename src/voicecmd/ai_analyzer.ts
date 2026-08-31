@@ -4,6 +4,7 @@
 /// <reference types="@songloft/plugin-sdk" />
 
 import type { AIConfig, AIAnalysisResult } from '../types';
+import { isVerbose } from '../utils/debug';
 
 /** AI System Prompt */
 const AI_SYSTEM_PROMPT = `从指令中提取出操作和音乐信息，返回JSON：{"action":"...","params":{...},"confidence":"high|medium|low","rawText":"有效文本"}
@@ -173,6 +174,14 @@ export class AIAnalyzer {
     opts: { json?: boolean; tools?: unknown[] } = {},
   ): Promise<LLMMessageResult> {
     songloft.log.info(`[AIAnalyzer] Calling ${config.api_url} model=${config.model} timeout=${config.timeout}s`);
+    if (isVerbose()) {
+      // verbose：打印完整请求 messages（内容截断到 200 字防刷屏），排查"DeepSeek 循环/多轮工具调用"时看全量对话轨迹
+      const brief = messages.map(m => {
+        const c = typeof m.content === 'string' ? m.content : JSON.stringify(m.content);
+        return `${m.role}: ${(c || '').slice(0, 200)}${(c || '').length > 200 ? '…' : ''}${m.tool_call_id ? ` [tool_result=${m.tool_call_id}]` : ''}`;
+      });
+      songloft.log.info(`[AIAnalyzer] REQUEST messages=${JSON.stringify(brief)} tools=${opts.tools ? opts.tools.length : 0} json=${!!opts.json}`);
+    }
 
     const body: Record<string, unknown> = {
       model: config.model,
@@ -240,6 +249,10 @@ export class AIAnalyzer {
     });
 
     songloft.log.info(`[AIAnalyzer] API response: "${content.slice(0, 150)}"${toolCalls.length ? ` + ${toolCalls.length} tool_call(s): ${toolCalls.map(t => `${t.name}(${JSON.stringify(t.args)})`).join(', ')}` : ''}`);
+    if (isVerbose()) {
+      // verbose：打印完整响应（含完整 content 与所有 tool_calls 原始参数），排查死循环/漏执行
+      songloft.log.info(`[AIAnalyzer] RESPONSE full: content="${content}" finish=${finishReason} tool_calls=${JSON.stringify(msg.tool_calls || [])}`);
+    }
     return { content, toolCalls };
   }
 
@@ -287,6 +300,9 @@ export class AIAnalyzer {
       while (res.toolCalls.length && round < 3) {
         round++;
         songloft.log.info(`[AIAnalyzer] [Tool] round ${round}: executing ${res.toolCalls.length} call(s)`);
+        if (isVerbose()) {
+          songloft.log.info(`[AIAnalyzer] [Tool] round ${round} raw: ${JSON.stringify(res.toolCalls.map(tc => ({ id: tc.id, name: tc.name, args: tc.args })))}`);
+        }
         const assistantMsg = {
           role: 'assistant',
           content: res.content || null,
@@ -300,6 +316,9 @@ export class AIAnalyzer {
         for (const tc of res.toolCalls) {
           const result = await this.executeBridgeTool(tc, config);
           songloft.log.info(`[AIAnalyzer] [Tool] ${tc.name}(${JSON.stringify(tc.args)}) → ${result}`);
+          if (isVerbose()) {
+            songloft.log.info(`[AIAnalyzer] [Tool] ${tc.name} full result: ${result}`);
+          }
           toolMessages.push({ role: 'tool', tool_call_id: tc.id, content: result });
         }
         res = await this.callLLMMessages(toolMessages, config, { tools });

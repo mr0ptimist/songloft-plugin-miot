@@ -157,6 +157,7 @@ export interface PluginConfig {
   play_announcement_delay: number;
   conversation_poll_interval: number;
   conversation_poll_debug?: boolean; // 会话轮询调试日志开关，默认 false（稳态轮询不打冗余日志）
+  verbose_log?: boolean; // 详细日志总开关，默认 false；开启后关键链路打印全量日志（不稳定排查时用）
   smart_resume_timeout: number;
   max_song_index: number;
   ai_config: AIConfig;

@@ -30,6 +30,12 @@ export interface PlaybackURLOptions {
  * 当初就是漏了 force_mp3，音箱拿到不能解码的流后亮灯不出声
  * （songloft-org/songloft-plugin-miot#62）。
  */
+
+/** 大文件自动转码阈值：本地歌曲超过此大小（30MB）播放时自动追加 format=mp3。
+ * 几百 MB 的 WAV/FLAC 直推会让音箱缓冲耗尽（拉流 200+ 秒）→ 播放中断"网络不行"；
+ * 转 mp3 后走服务端转码缓存（同一首歌只转一次，之后命中秒开）。 */
+export const LARGE_FILE_TRANSCODE_BYTES = 30 * 1024 * 1024;
+
 export function playbackOptionsOf(
   config: { force_mp3?: boolean; radio_force_mp3?: boolean; volume_normalize?: boolean },
   extra?: { seekSeconds?: number; speed?: number },

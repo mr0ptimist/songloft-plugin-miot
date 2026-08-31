@@ -71,6 +71,7 @@ function defaultPluginConfig(): PluginConfig {
     play_announcement_delay: 3,
     conversation_poll_interval: 1,
     conversation_poll_debug: false,
+    verbose_log: false,
     smart_resume_timeout: 30,
     max_song_index: 10000,
     ai_config: defaultAIConfig(),

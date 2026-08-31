@@ -18,3 +18,22 @@ export function isPollDebug(): boolean {
 export function setPollDebug(enabled: boolean): void {
   _pollDebug = !!enabled;
 }
+
+// ===== 详细日志总开关（verbose_log）=====
+//
+// 排查不稳定问题时把日志详细程度拉满：开启后关键链路（语音命令全流程、
+// 问答播报轮询、DeepSeek 请求/响应、工具调用、播放器操作、播放列表切歌）
+// 打印全量日志，便于精确定位。与轮询开关同模式：配置加载/更新时写入缓存，
+// 热路径用 isVerbose() 同步读取。对应 PluginConfig.verbose_log（默认 false）。
+
+let _verbose = false;
+
+/** 热路径同步读取详细日志总开关。 */
+export function isVerbose(): boolean {
+  return _verbose;
+}
+
+/** 由配置加载/更新时调用，更新缓存的开关值。 */
+export function setVerbose(enabled: boolean): void {
+  _verbose = !!enabled;
+}

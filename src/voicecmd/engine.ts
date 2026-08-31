@@ -16,6 +16,7 @@ import { OnlineSearcher } from './online_searcher';
 import { updateDeviceStatusCache } from '../handlers/playlist';
 import { callHostAPI, getHostAPIBaseUrl } from '../utils/http';
 import { findFavoritesPlaylist } from '../utils/favorites';
+import { isVerbose, setVerbose } from '../utils/debug';
 import { MemoryService } from '../memory';
 import { SleepTimer, parseTimeDuration, parseSongsCount, detectSleepTimerMode, formatRemaining } from '../sleep_timer';
 import type { PlaylistManager } from '../player/manager';
@@ -41,6 +42,14 @@ const PLAY_TRIGGER_PATTERN = /播放|放一首|放个|放首|放一下|我想听
  * 播放 Taylor 的 Timer 注册后 0.01s 被随后的"小爱"唤醒词清掉。
  */
 const WAKE_WORD_PATTERN = /^(小爱|小爱同学|你好小爱|小爱你好|小爱小爱|嘿小爱)([，。!！?？\s]*)$/;
+
+/**
+ * 全库随机播放触发词（完全匹配、无具体对象）：
+ * "随机播放/来点歌/随便放点歌"等 → 整个曲库随机（任意一首开始、自动切歌）。
+ * 带对象的不匹配此正则（如"随机播放周杰伦的歌"→ 走 AI play_artist 歌手随机）。
+ * 语义：已在播 → 把当前列表切成随机；未在播 → 从全库随机开始。
+ */
+const SHUFFLE_ALL_PATTERN = /^(随机播放|随机播|随机放点歌|随便放|随便放点歌|随便放首|随便放首歌|随便来点|随便来首歌|放点音乐|放首歌|放个歌|放首歌听听|放个音乐|放歌|来点歌|来点音乐|来首|来几首|随便听听|随机听听|全库随机|全部随机)$/;
 
 /**
  * 将回答拆成 ≤maxLen 字的短句分段，优先在句末标点处断句。
@@ -378,6 +387,41 @@ export class VoiceEngine {
     const accountId = await this.findAccountForDevice(msg.device_id);
     if (!accountId) {
       songloft.log.warn(`[VoiceEngine] No account found for device: ${msg.device_id}`);
+      return;
+    }
+
+    // 调试日志总开关："打开/开启调试日志" → verbose_log=true（关键链路全量日志），
+    // "关闭/关掉调试日志" → false。排查不稳定问题时一键拉满日志，稳定后关掉。
+    const debugOn = query.match(/^(打开|开启|启动)(调试|详细)日志$/);
+    const debugOff = query.match(/^(关闭|关掉|停止)(调试|详细)日志$/);
+    if (debugOn || debugOff) {
+      const cfg = await this.configManager.getConfig();
+      cfg.verbose_log = !!debugOn;
+      try {
+        await this.configManager.saveConfig(cfg);
+      } catch (e) {
+        songloft.log.warn(`[VoiceEngine] verbose_log save failed: ${String(e)}`);
+      }
+      setVerbose(cfg.verbose_log);
+      songloft.log.info(`[VoiceEngine] verbose_log ${cfg.verbose_log ? 'ON' : 'OFF'} via voice command: "${query}"`);
+      await this.minaService.textToSpeech(accountId, msg.device_id, cfg.verbose_log ? '调试日志已开启' : '调试日志已关闭');
+      return;
+    }
+
+    // 全库随机播放：无对象的"随机播放/来点歌/随便放点歌" → 整个曲库随机。
+    // 放在 fixed control 之前：纯"随机播放"会被 set_play_mode 口令抢先匹配成「切模式」，
+    // 但未在播时那只是空设模式、没有实际播放动作。
+    if (SHUFFLE_ALL_PATTERN.test(query.trim())) {
+      const pm = this.playlistManagerMap.get(accountId, msg.device_id);
+      // 用 isPlaying() 而非 hasPlaylist()：停止/暂停后列表仍在（可恢复），
+      // 但用户此时说"随机播放"是想从任意歌重新开始全库随机，不是切当前列表模式。
+      if (pm && pm.isPlaying()) {
+        // 正在播放：只把当前列表切成随机（不改歌）
+        songloft.log.info(`[VoiceEngine] ShuffleAll: already playing, switch current list to random`);
+        await this.executeSetPlayMode(accountId, msg.device_id, 'random');
+      } else {
+        await this.executePlayShuffleAll(accountId, msg.device_id);
+      }
       return;
     }
 
@@ -1169,6 +1213,71 @@ export class VoiceEngine {
    * 执行播放歌单
    * 通过 IndexingManager 模糊匹配歌单名，然后调用 PlaylistManager 播放
    */
+  /**
+   * 整个曲库随机播放：播"全部歌曲"歌单（含全部歌曲），随机起始 index + random 模式自动切歌。
+   * 用户不想按歌手/歌单，只想从任意一首开始随机听全库（"随机播放/来点歌/随便放点歌"）。
+   */
+  private async executePlayShuffleAll(accountId: string, deviceId: string): Promise<void> {
+    this.cancelPendingResume();
+    const pm = await this.playlistManagerMap.getOrCreate(accountId, deviceId);
+    pm.prepareForNewPlayback();
+    await this.interruptBroadcast(accountId, deviceId);
+
+    if (!this.indexingManager.isIndexReady()) {
+      const result = await this.indexingManager.refresh();
+      if (!result.success || !this.indexingManager.isIndexReady()) {
+        songloft.log.warn('[VoiceEngine] ShuffleAll: index not ready, skip');
+        return;
+      }
+    }
+
+    const matched = this.indexingManager.findPlaylistByName('全部歌曲');
+    if (!matched) {
+      songloft.log.warn('[VoiceEngine] ShuffleAll: playlist 全部歌曲 not found');
+      await this.minaService.textToSpeech(accountId, deviceId, '未找到全部歌曲歌单');
+      return;
+    }
+
+    // 惰性同步歌单 = 全库：新入库的歌曲自动进歌单、已删除的移出，
+    // 保证"随机播放"永远覆盖最新曲库（歌单不必手动维护）。
+    try {
+      await this.syncAllSongsPlaylist(matched.id);
+    } catch (e) {
+      songloft.log.warn(`[VoiceEngine] ShuffleAll: sync playlist failed (continue with existing): ${String(e)}`);
+    }
+
+    // 从任意一首开始：随机起始 index + random 模式（不读设备配置 mode，避免被 order 覆盖成顺序播）
+    const startIndex = Math.floor(Math.random() * Math.max(1, matched.songCount));
+    const ok = await pm.play(matched.id, startIndex, 'random');
+    if (ok) {
+      songloft.log.info(`[VoiceEngine] ShuffleAll: playlist=${matched.name} id=${matched.id} startIndex=${startIndex} mode=random`);
+    }
+  }
+
+  /**
+   * 惰性同步"全部歌曲"歌单 = 全库（每次"随机播放"前调用）：
+   * 全库歌曲 id vs 歌单现有歌曲 → 新增的加进歌单、已删除的移出。
+   * 首次/库变动时同步一次，之后无差异即零操作（一次轻量对比）。
+   */
+  private async syncAllSongsPlaylist(playlistId: number): Promise<void> {
+    const allIdsResp = await callHostAPI<{ ids?: number[] }>('GET', '/api/v1/songs/ids');
+    const allIds = new Set(allIdsResp?.ids || []);
+    const currentSongs = (await songloft.playlists.getSongs(playlistId, { limit: 100000 })) || [];
+    const currentIds = new Set(currentSongs.map(s => s.id));
+
+    const toAdd = Array.from(allIds).filter(id => !currentIds.has(id));
+    const toRemove = currentSongs.filter(s => !allIds.has(s.id)).map(s => s.id);
+
+    if (toAdd.length > 0) {
+      await songloft.playlists.addSongs(playlistId, toAdd);
+      songloft.log.info(`[VoiceEngine] ShuffleAll: ${toAdd.length} new song(s) synced into 全部歌曲`);
+    }
+    if (toRemove.length > 0) {
+      await songloft.playlists.removeSongs(playlistId, toRemove);
+      songloft.log.info(`[VoiceEngine] ShuffleAll: ${toRemove.length} deleted song(s) removed from 全部歌曲`);
+    }
+  }
+
   private async executePlayPlaylist(playlistName: string, accountId: string, deviceId: string): Promise<void> {
     this.cancelPendingResume();
     const pm = await this.playlistManagerMap.getOrCreate(accountId, deviceId);
@@ -2213,6 +2322,9 @@ export class VoiceEngine {
         body: JSON.stringify({ task: 'tts_url', args: { text } }),
       });
       const data = (await resp.json()) as { ok: boolean; result?: string; error?: string };
+      if (isVerbose()) {
+        songloft.log.info(`[VoiceEngine] [QA] tts_url bridge resp: ok=${data.ok} result=${String(data.result || '').slice(0, 300)} error=${data.error || ''}`);
+      }
       if (!data.ok || !data.result) {
         songloft.log.warn(`[VoiceEngine] [QA] tts_url task failed, fallback to segment TTS: ${data.error || 'no result'}`);
         return false;
@@ -2226,8 +2338,9 @@ export class VoiceEngine {
       return false;
     }
     try {
-      songloft.log.info(`[VoiceEngine] [QA] audio announce via URL: "${text.slice(0, 30)}..." len=${text.length} dur=${durationSec}s`);
+      songloft.log.info(`[VoiceEngine] [QA] audio announce via URL: "${text.slice(0, 30)}..." len=${text.length} dur=${durationSec}s url=${url}`);
       const ok = await this.minaService.playURL(accountId, deviceId, url);
+      songloft.log.info(`[VoiceEngine] [QA] audio announce playURL => ${ok} (account=${accountId} device=${deviceId})`);
       if (!ok) {
         songloft.log.warn('[VoiceEngine] [QA] audio announce playURL failed, fallback to segment TTS');
         return false;
@@ -2253,11 +2366,16 @@ export class VoiceEngine {
     await new Promise(r => setTimeout(r, 1200));   // 留出发送/起播延迟
     let sawPlaying = false;
     let lastStatus = -2;
+    let pollCount = 0;
     while (Date.now() - startTime < maxWaitMs) {
+      pollCount++;
       const { status } = await this.minaService.getPlayState(accountId, deviceId);
       if (status !== lastStatus) {
         songloft.log.info(`[VoiceEngine] [QA] audio poll: status=${status} (sawPlaying=${sawPlaying})`);
         lastStatus = status;
+      } else if (isVerbose()) {
+        // verbose：每次轮询都打（含 elapsed/次数），排查"播报没播/循环/提前停"时看完整状态轨迹
+        songloft.log.info(`[VoiceEngine] [QA] audio poll: status=${status} (sawPlaying=${sawPlaying}) #${pollCount} elapsed=${Math.round((Date.now() - startTime) / 1000)}s/${durationSec}s`);
       }
       if (status === 1) sawPlaying = true;
       if (sawPlaying && status !== 1) break;        // 播完：从 playing 回到非 playing
@@ -2273,8 +2391,11 @@ export class VoiceEngine {
       }
     }
     try {
-      await this.minaService.stopPlay(accountId, deviceId);
-    } catch { /* 停不掉不致命，下一条操作会再覆盖 */ }
+      const stopped = await this.minaService.stopPlay(accountId, deviceId);
+      if (isVerbose()) {
+        songloft.log.info(`[VoiceEngine] [QA] audio announce stopPlay => ${stopped} (after ${Math.round((Date.now() - startTime) / 1000)}s, sawPlaying=${sawPlaying})`);
+      }
+    } catch (e) { if (isVerbose()) songloft.log.info(`[VoiceEngine] [QA] audio announce stopPlay threw: ${String(e)}`); }
   }
 
   /**
@@ -2290,11 +2411,15 @@ export class VoiceEngine {
     await new Promise(r => setTimeout(r, 800));   // 留出发送延迟，让音箱开始念
     let sawPlaying = false;
     let lastStatus = -2;
+    let pollCount = 0;
     while (Date.now() - startTime < maxWaitMs) {
+      pollCount++;
       const { status } = await this.minaService.getPlayState(accountId, deviceId);
       if (status !== lastStatus) {
         songloft.log.info(`[VoiceEngine] [QA] TTS poll: status=${status} (sawPlaying=${sawPlaying})`);
         lastStatus = status;
+      } else if (isVerbose()) {
+        songloft.log.info(`[VoiceEngine] [QA] TTS poll: status=${status} (sawPlaying=${sawPlaying}) #${pollCount} elapsed=${Math.round((Date.now() - startTime) / 1000)}s`);
       }
       if (status === 1) sawPlaying = true;
       if (sawPlaying && status !== 1) break;       // 念完：从 playing 回到非 playing

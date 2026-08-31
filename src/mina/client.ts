@@ -5,7 +5,7 @@
 import { CookieJar } from '../utils/cookie';
 import { fetchWithRedirects } from '../utils/http';
 import { generateDeviceId } from '../utils/crypto';
-import { isPollDebug } from '../utils/debug';
+import { isPollDebug, isVerbose } from '../utils/debug';
 import {
   MINA_API_BASE_URL,
   MINA_SID,
@@ -282,6 +282,9 @@ export class MinaHTTPClient {
    */
   async playURL(deviceId: string, url: string, keepLight = false): Promise<boolean> {
     const message = { url, type: keepLight ? 1 : 2, media: 'app_ios' };
+    if (isVerbose()) {
+      songloft.log.info(`[MinaClient] play-url full message device=${deviceId} ${JSON.stringify(message)}`);
+    }
     const result = await this.ubusRequest(deviceId, 'player_play_url', 'mediaplayer', message, 'play-url');
     return this.isDeviceResultOK(result, 'player_play_url');
   }
@@ -323,6 +326,9 @@ export class MinaHTTPClient {
       music: JSON.stringify(music),
     };
 
+    if (isVerbose()) {
+      songloft.log.info(`[MinaClient] ${logLabel} full message device=${deviceId} startaudioid=${audioId} music=${message.music}`);
+    }
     const result = await this.ubusRequest(deviceId, 'player_play_music', 'mediaplayer', message, logLabel);
     return this.isDeviceResultOK(result, 'player_play_music');
   }

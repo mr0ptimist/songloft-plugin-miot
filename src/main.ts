@@ -30,7 +30,7 @@ import { registerLyricHandlers } from './handlers/lyric';
 import { registerGroupHandlers } from './handlers/group';
 import { registerSearchProviderComm } from './handlers/search_registry';
 import { setHostBaseUrl } from './utils/http';
-import { setPollDebug } from './utils/debug';
+import { setPollDebug, setVerbose } from './utils/debug';
 import { initStatusStream, handleStatusWebSocket, WS_STATUS_PATH } from './ws/status-stream';
 import { initConversationStream, handleConversationWebSocket, WS_CONVERSATION_PATH } from './ws/conversation-stream';
 
@@ -78,6 +78,8 @@ async function onInit(): Promise<void> {
 
   // 同步轮询调试日志开关到 debug 模块缓存（热路径同步读取，不能每 tick await 配置）
   setPollDebug(pluginConfig.conversation_poll_debug ?? false);
+  // 同步详细日志总开关（verbose_log）：排查不稳定问题时一键拉满日志
+  setVerbose(pluginConfig.verbose_log ?? false);
 
   conversationMonitor = new ConversationMonitor(accountManager, configManager);
   // 注入对话推送依赖（WebSocket 订阅端点 /conversation/ws 使用）

@@ -6,8 +6,9 @@
 
 import { ConfigManager } from '../config/manager';
 import { MinaService } from '../service/service';
-import { URLBuilder, playbackOptionsOf, playbackOptionsFromConfig } from './url_builder';
+import { URLBuilder, playbackOptionsOf, playbackOptionsFromConfig, LARGE_FILE_TRANSCODE_BYTES } from './url_builder';
 import { getHostBaseUrl, callHostAPI } from '../utils/http';
+import { isVerbose } from '../utils/debug';
 import type { PlayState, PlayMode, PlayerStatus, DeviceTargetRef, DeviceGroup } from '../types';
 
 /** 分配临时歌单唯一负数 ID（每个设备/歌手各一个，互不冲突） */
@@ -94,6 +95,7 @@ export class PlaylistManager {
   private songs: Song[] = [];
   private currentIndex: number = 0;
   private checkTimer: any = null;       // 定时器ID（基于歌曲时长的切歌定时器）
+  private timerStartedAt: number = 0;   // 最近一次 Timer 注册时间戳（verbose 报告"Timer 被清/触发耗时"用）
   private totalSongs: number = 0;
   private playStartTimeMs: number = 0;  // 当前歌曲开始播放的时间戳(ms)
   private randomPlayed: Set<number> = new Set(); // 随机模式已播放索引
@@ -959,7 +961,15 @@ export class PlaylistManager {
     const config = await this.configManager.getConfig();
 
     // 构造播放URL
-    const songURL = await URLBuilder.buildSongURL(song, playbackOptionsOf(config, { seekSeconds, speed: effectiveSpeed }));
+    const playbackOpts = playbackOptionsOf(config, { seekSeconds, speed: effectiveSpeed });
+    // 大文件自动转码：本地歌曲超过阈值（30MB）直推几百 MB 会让音箱缓冲耗尽
+    // （实测 300MB WAV 拉流 226-287 秒 → 播放中断"网络不行"）。自动追加 format=mp3
+    // 走服务端转码缓存（同一首歌只转一次落盘，之后命中秒开）。
+    if (song.type === 'local' && !playbackOpts.forceMp3 && song.file_size > LARGE_FILE_TRANSCODE_BYTES) {
+      playbackOpts.forceMp3 = true;
+      songloft.log.info(`[PlaylistManager] Large file ${Math.round(song.file_size / 1048576)}MB > 30MB, auto mp3 transcode: ${song.title}`);
+    }
+    const songURL = await URLBuilder.buildSongURL(song, playbackOpts);
     if (!songURL) {
       songloft.log.error('[PlaylistManager] Failed to build song URL: ' + song.title);
       return false;
@@ -1026,28 +1036,32 @@ export class PlaylistManager {
     const songUrl = nextSong.url;
     const title = nextSong.title;
     const isLocal = nextSong.type === 'local';
+    // 大文件本地歌（>30MB）：播放会自动转 mp3（见 playCurrent），切歌前必须预热转码，
+    // 否则切到下一首时首次实时转码 2-4 分钟、冷启动延迟。
+    const isLargeFile = isLocal && nextSong.file_size > LARGE_FILE_TRANSCODE_BYTES;
 
     void (async () => {
       // 与 playCurrent 共用同一个选项来源，保证预热的转码产物和真实播放 URL 命中同一缓存键。
       const opts = await playbackOptionsFromConfig(this.configManager);
       const forceMp3 = !!opts.forceMp3;
       const volumeNormalize = !!opts.normalize;
+      const transcode = forceMp3 || isLargeFile;
       // 本地歌曲已在服务端磁盘上：不开启转码选项时播放就是直接 ServeFile，无冷启动，预热无意义。
       // 但已下载的网络歌曲（MOV/MKV 等视频容器）也属于 local 类型，开启统一 MP3 / 音量均衡后
       // 播放要走 ffmpeg 转码（buildSongURL 对 local 同样追加 &format=mp3）；此时必须预热，
-      // 否则切歌时才实时转码、冷启动延迟（songloft-org/songloft#324）。
-      if (isLocal && !forceMp3 && !volumeNormalize) return;
+      // 否则切歌时才实时转码、冷启动延迟（songloft-org/songloft#324）。大文件同理。
+      if (isLocal && !transcode && !volumeNormalize) return;
       const separator = songUrl.includes('?') ? '&' : '?';
-      let prefetchPath = songUrl + separator + 'prefetch=1' + (forceMp3 ? '&format=mp3' : '');
+      let prefetchPath = songUrl + separator + 'prefetch=1' + (transcode ? '&format=mp3' : '');
       if (volumeNormalize) {
         prefetchPath += '&normalize=1';
-        if (!forceMp3) {
+        if (!transcode) {
           prefetchPath += '&format=mp3';
         }
       }
       try {
         await callHostAPI('GET', prefetchPath, undefined, { timeoutMs: 5000 });
-        songloft.log.info(`[PlaylistManager] Prefetch next song index=${nextIdx} title=${title}${forceMp3 ? ' (mp3)' : ''}`);
+        songloft.log.info(`[PlaylistManager] Prefetch next song index=${nextIdx} title=${title}${transcode ? ' (mp3)' : ''}`);
       } catch (e) {
         songloft.log.warn('[PlaylistManager] Prefetch failed: ' + String(e));
       }
@@ -1193,14 +1207,19 @@ export class PlaylistManager {
 
     const delayMs = Math.max(1, Math.floor(durationSec * 1000));
     songloft.log.info('[PlaylistManager] Timer registered delayMs=' + delayMs);
+    if (isVerbose()) {
+      songloft.log.info(`[PlaylistManager] Timer registered detail: song=${this.currentSong?.title || '?'} index=${this.currentIndex} duration=${durationSec}s state=${this.state}`);
+    }
 
     this.checkTimer = setTimeout(() => {
       this.checkTimer = null;
-      songloft.log.info('[PlaylistManager] Timer fired');
+      const elapsed = Date.now() - this.timerStartedAt;
+      songloft.log.info(`[PlaylistManager] Timer fired (after ${elapsed}ms, expected ${delayMs}ms)`);
       this.onSongFinished().catch(e => {
         songloft.log.error('[PlaylistManager] onSongFinished error: ' + String(e));
       });
     }, delayMs);
+    this.timerStartedAt = Date.now();
   }
 
   /**
@@ -1210,6 +1229,13 @@ export class PlaylistManager {
     if (this.checkTimer !== null) {
       clearTimeout(this.checkTimer);
       this.checkTimer = null;
+      if (isVerbose()) {
+        // verbose：报告"谁清了 Timer"——排查"只播一首/不自动切歌"时，
+        // 直接看日志里每条 stopCheckTimer 前后的调用者日志即可定位
+        songloft.log.info(`[PlaylistManager] stopCheckTimer: cleared active timer (was registered ${Date.now() - this.timerStartedAt}ms ago)`);
+      }
+    } else if (isVerbose()) {
+      songloft.log.info('[PlaylistManager] stopCheckTimer: no active timer');
     }
   }
 
